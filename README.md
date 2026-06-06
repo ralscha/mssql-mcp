@@ -4,7 +4,7 @@ An [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) server that 
 
 ## Features
 
-- **20 MCP tools** covering schema search, table description, data profiling, relationship/dependency inspection, query explanation, connection testing, and tiered write access
+- **23 MCP tools** covering schema search, table description, data profiling, relationship/dependency inspection, object listing, DDL inspection, query explanation, connection testing, and tiered write access
 - **Tiered access model** via `MSSQL_ACCESS_LEVEL`: `READONLY` (default), `DML-RW` (adds insert/update/delete), `DDL-RW` (adds create/drop table/index)
 - **SQL-safe design** with identifier quoting, multipart name validation, and read-only query enforcement
 - **Read-only query guard** that rejects mutating statements (`INSERT`, `UPDATE`, `DELETE`, `MERGE`, `CREATE`, `ALTER`, `DROP`, `TRUNCATE`, `EXEC`, etc.) on the `read_data` tool
@@ -23,10 +23,10 @@ Download the latest release for your platform from the [Releases](https://github
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `MSSQL_SERVER` | Yes | — | SQL Server hostname or IP |
-| `MSSQL_DATABASE` | Yes | — | Database name |
-| `MSSQL_USERNAME` | Yes | — | Login username |
-| `MSSQL_PASSWORD` | Yes | — | Login password |
+| `MSSQL_SERVER` | Yes | - | SQL Server hostname or IP |
+| `MSSQL_DATABASE` | Yes | - | Database name |
+| `MSSQL_USERNAME` | Yes | - | Login username |
+| `MSSQL_PASSWORD` | Yes | - | Login password |
 | `MSSQL_PORT` | No | `1433` | SQL Server port |
 | `MSSQL_ACCESS_LEVEL` | No | `READONLY` | `READONLY`, `DML-RW`, or `DDL-RW` |
 | `MSSQL_TRUST_SERVER_CERTIFICATE` | No | `false` | Trust self-signed certificates |
@@ -77,9 +77,9 @@ http://localhost:8080/sse
 
 ### Access Levels
 
-- **`READONLY`** (default) — Schema exploration, data reading, profiling, relationship inspection, query explanation, connection testing. 13 tools.
-- **`DML-RW`** — All read-only tools plus `insert_data`, `update_data`, `delete_data`. 16 tools.
-- **`DDL-RW`** — All DML tools plus `create_table`, `create_index`, `drop_table`. 20 tools.
+- **`READONLY`** (default) - Schema exploration, object listing, data reading, profiling, relationship inspection, DDL inspection, query explanation, connection testing. 17 tools.
+- **`DML-RW`** - All read-only tools plus `insert_data`, `update_data`, `delete_data`. 20 tools.
+- **`DDL-RW`** - All DML tools plus `create_table`, `create_index`, `drop_table`. 23 tools.
 
 Mutations (`update_data`, `delete_data`, `drop_table`) require a `"confirm": true` flag when `MSSQL_REQUIRE_CONFIRMATION` is enabled (the default). Without confirmation, the server returns a preview of the affected rows instead.
 
@@ -101,6 +101,11 @@ Mutations (`update_data`, `delete_data`, `drop_table`) require a `"confirm": tru
 | `read_data` | Execute a read-only SELECT query with row limits |
 | `test_connection` | Ping the server and return latency and server version info |
 | `validate_environment_config` | Validate that all environment variables are correctly configured |
+| `list_schemas` | List database schemas and owners |
+| `list_views` | List views and their definitions |
+| `list_triggers` | List table triggers, events, timing, and definitions |
+| `show_create_table` | Generate a CREATE TABLE statement for an existing table |
+| `table_size` | Report estimated row counts and table/index size in KB |
 
 ### DML (DML-RW)
 
