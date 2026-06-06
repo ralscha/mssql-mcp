@@ -57,6 +57,11 @@ func (r *Registry) addReadOnly(server *mcp.Server) {
 	mcp.AddTool(server, r.tool("read_data"), r.readData)
 	mcp.AddTool(server, r.tool("test_connection"), r.testConnection)
 	mcp.AddTool(server, r.tool("validate_environment_config"), r.validateEnvironmentConfig)
+	mcp.AddTool(server, r.tool("list_schemas"), r.listSchemas)
+	mcp.AddTool(server, r.tool("list_views"), r.listViews)
+	mcp.AddTool(server, r.tool("list_triggers"), r.listTriggers)
+	mcp.AddTool(server, r.tool("show_create_table"), r.showCreateTable)
+	mcp.AddTool(server, r.tool("table_size"), r.tableSize)
 }
 
 func (r *Registry) addDML(server *mcp.Server) {
@@ -410,6 +415,189 @@ type ValidationOutput struct {
 func (r *Registry) validateEnvironmentConfig(context.Context, *mcp.CallToolRequest, any) (*mcp.CallToolResult, ValidationOutput, error) {
 	err := r.client.Config.Validate()
 	return nil, ValidationOutput{Valid: err == nil, Config: r.client.Config.PublicSummary()}, err
+}
+
+func (r *Registry) listSchemas(ctx context.Context, _ *mcp.CallToolRequest, _ any) (*mcp.CallToolResult, RowsOutput, error) {
+	ctx, cancel := r.client.TimeoutContext(ctx)
+	defer cancel()
+	rows, err := r.client.Query(ctx, `
+SELECT s.name AS [schema],
+       dp.name AS [owner],
+       s.schema_id AS [schemaId]
+FROM sys.schemas s
+LEFT JOIN sys.database_principals dp ON s.principal_id = dp.principal_id
+WHERE s.name NOT IN ('INFORMATION_SCHEMA', 'sys')
+ORDER BY s.name`)
+	return nil, RowsOutput{Rows: rows}, err
+}
+
+func (r *Registry) listViews(ctx context.Context, _ *mcp.CallToolRequest, _ any) (*mcp.CallToolResult, RowsOutput, error) {
+	ctx, cancel := r.client.TimeoutContext(ctx)
+	defer cancel()
+	rows, err := r.client.Query(ctx, `
+SELECT s.name AS [schema],
+       v.name AS [view],
+       OBJECT_DEFINITION(v.object_id) AS [definition]
+FROM sys.views v
+JOIN sys.schemas s ON v.schema_id = s.schema_id
+ORDER BY s.name, v.name`)
+	return nil, RowsOutput{Rows: rows}, err
+}
+
+func (r *Registry) listTriggers(ctx context.Context, _ *mcp.CallToolRequest, _ any) (*mcp.CallToolResult, RowsOutput, error) {
+	ctx, cancel := r.client.TimeoutContext(ctx)
+	defer cancel()
+	rows, err := r.client.Query(ctx, `
+SELECT ts.name AS [schema],
+       tr.name AS [name],
+       ps.name AS [tableSchema],
+       parent.name AS [table],
+       CASE WHEN tr.is_instead_of_trigger = 1 THEN 'INSTEAD OF' ELSE 'AFTER' END AS [timing],
+       events.events AS [event],
+       OBJECT_DEFINITION(tr.object_id) AS [definition]
+FROM sys.triggers tr
+JOIN sys.objects parent ON tr.parent_id = parent.object_id
+JOIN sys.schemas ps ON parent.schema_id = ps.schema_id
+JOIN sys.schemas ts ON tr.schema_id = ts.schema_id
+OUTER APPLY (
+    SELECT STUFF((
+        SELECT ', ' + te.type_desc
+        FROM sys.trigger_events te
+        WHERE te.object_id = tr.object_id
+        ORDER BY te.type_desc
+        FOR XML PATH(''), TYPE
+    ).value('.', 'nvarchar(max)'), 1, 2, '') AS events
+) events
+WHERE tr.parent_class_desc = 'OBJECT_OR_COLUMN'
+ORDER BY ps.name, parent.name, tr.name`)
+	return nil, RowsOutput{Rows: rows}, err
+}
+
+type DDLOutput struct {
+	DDL string `json:"ddl"`
+}
+
+func (r *Registry) showCreateTable(ctx context.Context, _ *mcp.CallToolRequest, in TableInput) (*mcp.CallToolResult, DDLOutput, error) {
+	ctx, cancel := r.client.TimeoutContext(ctx)
+	defer cancel()
+	schema, table, err := splitTable(in.Table)
+	if err != nil {
+		return nil, DDLOutput{}, err
+	}
+	qname, err := sqlsafe.QuoteMultipart(schema + "." + table)
+	if err != nil {
+		return nil, DDLOutput{}, err
+	}
+
+	cols, err := r.client.Query(ctx, `
+SELECT c.name AS [name],
+       CASE
+         WHEN t.name IN ('varchar', 'char', 'varbinary', 'binary') THEN t.name + '(' + CASE WHEN c.max_length = -1 THEN 'MAX' ELSE CONVERT(varchar(10), c.max_length) END + ')'
+         WHEN t.name IN ('nvarchar', 'nchar') THEN t.name + '(' + CASE WHEN c.max_length = -1 THEN 'MAX' ELSE CONVERT(varchar(10), c.max_length / 2) END + ')'
+         WHEN t.name IN ('decimal', 'numeric') THEN t.name + '(' + CONVERT(varchar(10), c.precision) + ',' + CONVERT(varchar(10), c.scale) + ')'
+         WHEN t.name IN ('datetime2', 'datetimeoffset', 'time') THEN t.name + '(' + CONVERT(varchar(10), c.scale) + ')'
+         ELSE t.name
+       END AS [type],
+       c.is_nullable AS [nullable],
+       dc.definition AS [defaultVal],
+       ic.seed_value AS [identitySeed],
+       ic.increment_value AS [identityIncrement],
+       cc.definition AS [computedDefinition],
+       cc.is_persisted AS [computedPersisted]
+FROM sys.columns c
+JOIN sys.types t ON c.user_type_id = t.user_type_id
+JOIN sys.tables tb ON c.object_id = tb.object_id
+JOIN sys.schemas s ON tb.schema_id = s.schema_id
+LEFT JOIN sys.default_constraints dc ON c.default_object_id = dc.object_id
+LEFT JOIN sys.identity_columns ic ON c.object_id = ic.object_id AND c.column_id = ic.column_id
+LEFT JOIN sys.computed_columns cc ON c.object_id = cc.object_id AND c.column_id = cc.column_id
+WHERE s.name = @p1 AND tb.name = @p2
+ORDER BY c.column_id`, schema, table)
+	if err != nil {
+		return nil, DDLOutput{}, err
+	}
+
+	colDefs := make([]string, 0, len(cols)+1)
+	for _, col := range cols {
+		name, _ := col["name"].(string)
+		typ, _ := col["type"].(string)
+		qcol, err := sqlsafe.QuoteIdentifier(name)
+		if err != nil {
+			return nil, DDLOutput{}, err
+		}
+		if computed, _ := col["computedDefinition"].(string); computed != "" {
+			def := qcol + " AS " + computed
+			if persisted, _ := col["computedPersisted"].(bool); persisted {
+				def += " PERSISTED"
+			}
+			colDefs = append(colDefs, def)
+			continue
+		}
+		def := qcol + " " + typ
+		if seed, ok := col["identitySeed"]; ok && seed != nil {
+			increment := col["identityIncrement"]
+			def += fmt.Sprintf(" IDENTITY(%v,%v)", seed, increment)
+		}
+		if defaultVal, _ := col["defaultVal"].(string); defaultVal != "" {
+			def += " DEFAULT " + defaultVal
+		}
+		if nullable, _ := col["nullable"].(bool); nullable {
+			def += " NULL"
+		} else {
+			def += " NOT NULL"
+		}
+		colDefs = append(colDefs, def)
+	}
+
+	pks, err := r.client.Query(ctx, `
+SELECT c.name AS [column], ic.is_descending_key AS [descending]
+FROM sys.indexes i
+JOIN sys.index_columns ic ON i.object_id = ic.object_id AND i.index_id = ic.index_id
+JOIN sys.columns c ON ic.object_id = c.object_id AND ic.column_id = c.column_id
+JOIN sys.tables t ON i.object_id = t.object_id
+JOIN sys.schemas s ON t.schema_id = s.schema_id
+WHERE i.is_primary_key = 1 AND s.name = @p1 AND t.name = @p2
+ORDER BY ic.key_ordinal`, schema, table)
+	if err != nil {
+		return nil, DDLOutput{}, err
+	}
+	pkCols := make([]string, 0, len(pks))
+	for _, pk := range pks {
+		name, _ := pk["column"].(string)
+		qcol, err := sqlsafe.QuoteIdentifier(name)
+		if err != nil {
+			return nil, DDLOutput{}, err
+		}
+		if desc, _ := pk["descending"].(bool); desc {
+			qcol += " DESC"
+		}
+		pkCols = append(pkCols, qcol)
+	}
+	if len(pkCols) > 0 {
+		colDefs = append(colDefs, "PRIMARY KEY ("+strings.Join(pkCols, ", ")+")")
+	}
+
+	ddl := "CREATE TABLE " + qname + " (\n    " + strings.Join(colDefs, ",\n    ") + "\n);"
+	return nil, DDLOutput{DDL: ddl}, nil
+}
+
+func (r *Registry) tableSize(ctx context.Context, _ *mcp.CallToolRequest, _ any) (*mcp.CallToolResult, RowsOutput, error) {
+	ctx, cancel := r.client.TimeoutContext(ctx)
+	defer cancel()
+	rows, err := r.client.Query(ctx, `
+SELECT s.name AS [schema],
+       t.name AS [table],
+       SUM(CASE WHEN ps.index_id IN (0, 1) THEN ps.row_count ELSE 0 END) AS [estimatedRows],
+       SUM(ps.reserved_page_count) * 8 AS [totalSizeKB],
+       SUM(ps.used_page_count) * 8 AS [usedSizeKB],
+       SUM(CASE WHEN ps.index_id IN (0, 1) THEN ps.in_row_data_page_count + ps.lob_used_page_count + ps.row_overflow_used_page_count ELSE 0 END) * 8 AS [tableSizeKB],
+       (SUM(ps.used_page_count) - SUM(CASE WHEN ps.index_id IN (0, 1) THEN ps.in_row_data_page_count + ps.lob_used_page_count + ps.row_overflow_used_page_count ELSE 0 END)) * 8 AS [indexSizeKB]
+FROM sys.tables t
+JOIN sys.schemas s ON t.schema_id = s.schema_id
+JOIN sys.dm_db_partition_stats ps ON t.object_id = ps.object_id
+GROUP BY s.name, t.name
+ORDER BY SUM(ps.reserved_page_count) DESC, s.name, t.name`)
+	return nil, RowsOutput{Rows: rows}, err
 }
 
 type InsertInput struct {
