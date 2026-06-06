@@ -1,0 +1,58 @@
+version: '3'
+
+tasks:
+  default:
+    desc: List all available tasks
+    silent: true
+    cmds:
+      - task --list
+
+  format:
+    desc: Format all Go source files
+    cmds:
+      - go fix ./...
+      - go fmt ./...
+      - cd demos/supply-chain-detective && go fix ./...
+      - cd demos/supply-chain-detective && go fmt ./...
+
+  test:
+    desc: Run all Go tests
+    cmds:
+      - go test ./...
+      - cd demos/supply-chain-detective && go test ./...
+
+  lint:
+    desc: Run golangci-lint in a Docker container
+    cmds:
+      - docker run --rm -v {{toSlash .ROOT_DIR}}:/app -w /app golangci/golangci-lint:v2.12.2 golangci-lint run -v --timeout 5m
+      - docker run --rm -v {{toSlash .ROOT_DIR}}:/app -w /app/demos/supply-chain-detective golangci/golangci-lint:v2.12.2 golangci-lint run -v --timeout 5m
+
+  demo:
+    desc: Show how to run the Supply Chain Detective demo
+    silent: true
+    cmds:
+      - |
+        echo "Supply Chain Detective demo"
+        echo ""
+        echo "Terminal 1:"
+        echo "  task demo:start"
+        echo ""
+        echo "Terminal 2, after copying the MSSQL_* values printed by Terminal 1:"
+        echo "  task demo:client"
+        echo ""
+        echo "Optional, if you already have a compatible SQL Server image cached:"
+        echo '  $env:MSSQL_DEMO_IMAGE = "mcr.microsoft.com/mssql/server:2022-latest"'
+        echo "  task demo:start"
+
+  demo:start:
+    desc: Start the seeded MSSQL Testcontainers demo database
+    dir: demos/supply-chain-detective
+    cmds:
+      - go run .
+
+  demo:client:
+    desc: Run the MCP client that analyzes the seeded demo database
+    dir: demos/supply-chain-detective
+    cmds:
+      - go run ./client
+
