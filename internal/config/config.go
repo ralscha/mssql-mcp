@@ -10,11 +10,15 @@ import (
 )
 
 type AccessLevel string
+type Transport string
 
 const (
 	ReadOnly AccessLevel = "READONLY"
 	DMLRW    AccessLevel = "DML-RW"
 	DDLRW    AccessLevel = "DDL-RW"
+
+	StdioTransport Transport = "stdio"
+	SSETransport   Transport = "sse"
 )
 
 type Config struct {
@@ -29,6 +33,9 @@ type Config struct {
 	QueryTimeout           time.Duration
 	MaxRowsDefault         int
 	RequireConfirmation    bool
+	Transport              Transport
+	HTTPAddr               string
+	SSEPath                string
 }
 
 func ParseAccessLevel(s string) (AccessLevel, error) {
@@ -46,6 +53,19 @@ func ParseAccessLevel(s string) (AccessLevel, error) {
 	}
 }
 
+func ParseTransport(s string) (Transport, error) {
+	switch Transport(strings.ToLower(strings.TrimSpace(s))) {
+	case "":
+		return StdioTransport, nil
+	case StdioTransport:
+		return StdioTransport, nil
+	case SSETransport:
+		return SSETransport, nil
+	default:
+		return "", fmt.Errorf("invalid MSSQL_TRANSPORT %q, expected stdio or sse", s)
+	}
+}
+
 func (l AccessLevel) AllowsDML() bool {
 	return l == DMLRW || l == DDLRW
 }
@@ -56,6 +76,10 @@ func (l AccessLevel) AllowsDDL() bool {
 
 func Load() (Config, error) {
 	level, err := ParseAccessLevel(os.Getenv("MSSQL_ACCESS_LEVEL"))
+	if err != nil {
+		return Config{}, err
+	}
+	transport, err := ParseTransport(os.Getenv("MSSQL_TRANSPORT"))
 	if err != nil {
 		return Config{}, err
 	}
@@ -71,6 +95,9 @@ func Load() (Config, error) {
 		QueryTimeout:           durationSecondsEnv("MSSQL_QUERY_TIMEOUT", 120*time.Second),
 		MaxRowsDefault:         intEnv("MSSQL_MAX_ROWS_DEFAULT", 1000),
 		RequireConfirmation:    boolEnv("MSSQL_REQUIRE_CONFIRMATION", true),
+		Transport:              transport,
+		HTTPAddr:               stringEnv("MSSQL_HTTP_ADDR", ":8080"),
+		SSEPath:                stringEnv("MSSQL_SSE_PATH", "/sse"),
 	}
 	return cfg, cfg.Validate()
 }
@@ -99,6 +126,15 @@ func (c Config) Validate() error {
 	}
 	if c.MaxRowsDefault <= 0 || c.MaxRowsDefault > 100000 {
 		return fmt.Errorf("MSSQL_MAX_ROWS_DEFAULT must be between 1 and 100000")
+	}
+	if c.Transport != StdioTransport && c.Transport != SSETransport {
+		return fmt.Errorf("MSSQL_TRANSPORT must be stdio or sse")
+	}
+	if c.HTTPAddr == "" {
+		return fmt.Errorf("MSSQL_HTTP_ADDR is required")
+	}
+	if !strings.HasPrefix(c.SSEPath, "/") {
+		return fmt.Errorf("MSSQL_SSE_PATH must start with /")
 	}
 	return nil
 }
@@ -131,7 +167,17 @@ func (c Config) PublicSummary() map[string]any {
 		"queryTimeoutSec":        int(c.QueryTimeout.Seconds()),
 		"maxRowsDefault":         c.MaxRowsDefault,
 		"requireConfirmation":    c.RequireConfirmation,
+		"transport":              c.Transport,
+		"httpAddr":               c.HTTPAddr,
+		"ssePath":                c.SSEPath,
 	}
+}
+
+func stringEnv(name, fallback string) string {
+	if v := strings.TrimSpace(os.Getenv(name)); v != "" {
+		return v
+	}
+	return fallback
 }
 
 func intEnv(name string, fallback int) int {

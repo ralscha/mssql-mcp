@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"log"
+	"net/http"
 	"os"
 
 	"mssql-mcp/internal/config"
@@ -42,9 +43,26 @@ func run() int {
 	})
 	tools.Register(server, client)
 
-	if err := server.Run(context.Background(), &mcp.StdioTransport{}); err != nil {
+	if err := runServer(context.Background(), cfg, server); err != nil {
 		log.Print(err)
 		return 1
 	}
 	return 0
+}
+
+func runServer(ctx context.Context, cfg config.Config, server *mcp.Server) error {
+	switch cfg.Transport {
+	case config.StdioTransport:
+		return server.Run(ctx, &mcp.StdioTransport{})
+	case config.SSETransport:
+		handler := mcp.NewSSEHandler(func(*http.Request) *mcp.Server {
+			return server
+		}, nil)
+		mux := http.NewServeMux()
+		mux.Handle(cfg.SSEPath, handler)
+		log.Printf("mssql-mcp listening for SSE at http://%s%s", cfg.HTTPAddr, cfg.SSEPath)
+		return http.ListenAndServe(cfg.HTTPAddr, mux)
+	default:
+		return cfg.Validate()
+	}
 }

@@ -34,10 +34,13 @@ Download the latest release for your platform from the [Releases](https://github
 | `MSSQL_QUERY_TIMEOUT` | No | `120` | Query timeout in seconds |
 | `MSSQL_MAX_ROWS_DEFAULT` | No | `1000` | Default row limit for queries |
 | `MSSQL_REQUIRE_CONFIRMATION` | No | `true` | Require confirm flag for writes |
+| `MSSQL_TRANSPORT` | No | `stdio` | MCP transport: `stdio` or `sse` |
+| `MSSQL_HTTP_ADDR` | No | `:8080` | HTTP listen address when `MSSQL_TRANSPORT=sse` |
+| `MSSQL_SSE_PATH` | No | `/sse` | SSE endpoint path when `MSSQL_TRANSPORT=sse` |
 
 ### Running as an MCP Server
 
-The server communicates over stdio. Configure your MCP client to launch it:
+By default, the server communicates over stdio. Configure your MCP client to launch it:
 
 ```json
 {
@@ -55,6 +58,21 @@ The server communicates over stdio. Configure your MCP client to launch it:
     }
   }
 }
+```
+
+To serve MCP over SSE instead, set `MSSQL_TRANSPORT=sse` and run the server as an HTTP process:
+
+```bash
+MSSQL_TRANSPORT=sse \
+MSSQL_HTTP_ADDR=:8080 \
+MSSQL_SSE_PATH=/sse \
+/path/to/bin/mssql-mcp
+```
+
+Then configure an SSE-capable MCP client to connect to:
+
+```text
+http://localhost:8080/sse
 ```
 
 ### Access Levels
