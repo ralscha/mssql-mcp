@@ -41,7 +41,33 @@ func ToolNamesForLevel(level config.AccessLevel) []string {
 
 func (r *Registry) tool(name string) *mcp.Tool {
 	r.names = append(r.names, name)
-	return &mcp.Tool{Name: name}
+	return &mcp.Tool{Name: name, Description: toolDescriptions[name]}
+}
+
+var toolDescriptions = map[string]string{
+	"search_schema":               "Find tables and columns by name.",
+	"describe_table":              "Show columns, keys, and indexes.",
+	"list_table":                  "List database tables.",
+	"list_databases":              "List SQL Server databases.",
+	"list_environments":           "Show active connection settings.",
+	"profile_table":               "Summarize table rows and columns.",
+	"inspect_relationships":       "Show foreign-key relationships.",
+	"inspect_dependencies":        "Find objects depending on a table.",
+	"explain_query":               "Return the execution plan for SELECT.",
+	"read_data":                   "Run a read-only SELECT query.",
+	"test_connection":             "Verify SQL Server connectivity.",
+	"validate_environment_config": "Validate connection configuration.",
+	"list_schemas":                "List database schemas.",
+	"list_views":                  "List database views.",
+	"list_triggers":               "List database triggers.",
+	"show_create_table":           "Generate CREATE TABLE DDL.",
+	"table_size":                  "Show table size estimates.",
+	"insert_data":                 "Insert rows into a table.",
+	"update_data":                 "Update rows matching a filter.",
+	"delete_data":                 "Delete rows matching a filter.",
+	"create_table":                "Create a database table.",
+	"create_index":                "Create an index on a table.",
+	"drop_table":                  "Drop a database table.",
 }
 
 func (r *Registry) addReadOnly(server *mcp.Server) {
