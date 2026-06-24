@@ -105,24 +105,24 @@ func TestLoadEncryptDefaultsTrue(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load() unexpected error: %v", err)
 	}
-	if !cfg.Encrypt {
-		t.Fatal("Load() should default MSSQL_ENCRYPT to true")
+	if cfg.Encrypt != "true" {
+		t.Fatalf("Load() MSSQL_ENCRYPT = %q, want true", cfg.Encrypt)
 	}
 }
 
-func TestLoadEncryptFalse(t *testing.T) {
+func TestLoadEncryptString(t *testing.T) {
 	t.Setenv("MSSQL_SERVER", "localhost")
 	t.Setenv("MSSQL_DATABASE", "db")
 	t.Setenv("MSSQL_USERNAME", "sa")
 	t.Setenv("MSSQL_PASSWORD", "password")
-	t.Setenv("MSSQL_ENCRYPT", "false")
+	t.Setenv("MSSQL_ENCRYPT", "strict")
 
 	cfg, err := Load()
 	if err != nil {
 		t.Fatalf("Load() unexpected error: %v", err)
 	}
-	if cfg.Encrypt {
-		t.Fatal("Load() should honor MSSQL_ENCRYPT=false")
+	if cfg.Encrypt != "strict" {
+		t.Fatalf("Load() MSSQL_ENCRYPT = %q, want strict", cfg.Encrypt)
 	}
 }
 
@@ -133,7 +133,7 @@ func TestConnectionStringEncrypt(t *testing.T) {
 		Database:          "db",
 		Username:          "sa",
 		Password:          "password",
-		Encrypt:           false,
+		Encrypt:           "disable",
 		ConnectionTimeout: 30 * time.Second,
 	}
 
@@ -141,7 +141,7 @@ func TestConnectionStringEncrypt(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ConnectionString() returned invalid URL: %v", err)
 	}
-	if got := u.Query().Get("encrypt"); got != "false" {
-		t.Fatalf("ConnectionString() encrypt = %q, want false", got)
+	if got := u.Query().Get("encrypt"); got != "disable" {
+		t.Fatalf("ConnectionString() encrypt = %q, want disable", got)
 	}
 }

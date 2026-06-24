@@ -28,7 +28,7 @@ type Config struct {
 	Database               string
 	Username               string
 	Password               string
-	Encrypt                bool
+	Encrypt                string
 	TrustServerCertificate bool
 	ConnectionTimeout      time.Duration
 	QueryTimeout           time.Duration
@@ -91,7 +91,7 @@ func Load() (Config, error) {
 		Username:               os.Getenv("MSSQL_USERNAME"),
 		Password:               os.Getenv("MSSQL_PASSWORD"),
 		Port:                   intEnv("MSSQL_PORT", 1433),
-		Encrypt:                boolEnv("MSSQL_ENCRYPT", true),
+		Encrypt:                stringEnv("MSSQL_ENCRYPT", "true"),
 		TrustServerCertificate: boolEnv("MSSQL_TRUST_SERVER_CERTIFICATE", false),
 		ConnectionTimeout:      durationSecondsEnv("MSSQL_CONNECTION_TIMEOUT", 30*time.Second),
 		QueryTimeout:           durationSecondsEnv("MSSQL_QUERY_TIMEOUT", 120*time.Second),
@@ -150,7 +150,7 @@ func (c Config) ConnectionString() string {
 	q := u.Query()
 	q.Set("database", c.Database)
 	q.Set("connection timeout", strconv.Itoa(int(c.ConnectionTimeout.Seconds())))
-	q.Set("encrypt", strconv.FormatBool(c.Encrypt))
+	q.Set("encrypt", c.Encrypt)
 	q.Set("TrustServerCertificate", strconv.FormatBool(c.TrustServerCertificate))
 	u.RawQuery = q.Encode()
 	return u.String()

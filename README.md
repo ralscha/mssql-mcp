@@ -29,7 +29,7 @@ Download the latest release for your platform from the [Releases](https://github
 | `MSSQL_PASSWORD` | Yes | - | Login password |
 | `MSSQL_PORT` | No | `1433` | SQL Server port |
 | `MSSQL_ACCESS_LEVEL` | No | `READONLY` | `READONLY`, `DML-RW`, or `DDL-RW` |
-| `MSSQL_ENCRYPT` | No | `true` | Enable encrypted SQL Server connections |
+| `MSSQL_ENCRYPT` | No | `true` | SQL Server driver encryption setting |
 | `MSSQL_TRUST_SERVER_CERTIFICATE` | No | `false` | Trust self-signed certificates |
 | `MSSQL_CONNECTION_TIMEOUT` | No | `30` | Connection timeout in seconds |
 | `MSSQL_QUERY_TIMEOUT` | No | `120` | Query timeout in seconds |
@@ -38,6 +38,13 @@ Download the latest release for your platform from the [Releases](https://github
 | `MSSQL_TRANSPORT` | No | `stdio` | MCP transport: `stdio` or `sse` |
 | `MSSQL_HTTP_ADDR` | No | `:8080` | HTTP listen address when `MSSQL_TRANSPORT=sse` |
 | `MSSQL_SSE_PATH` | No | `/sse` | SSE endpoint path when `MSSQL_TRANSPORT=sse` |
+
+`MSSQL_ENCRYPT` is passed through to the SQL Server driver as the `encrypt` connection parameter. Supported values include:
+
+- `strict` - Data sent between client and server is encrypted end-to-end using [TDS 8.0](https://learn.microsoft.com/en-us/sql/relational-databases/security/networking/tds-8?view=sql-server-ver16).
+- `disable` - Data sent between client and server is not encrypted.
+- `false`, `optional`, `no`, `0`, `f` - Data sent between client and server is not encrypted beyond the login packet.
+- `true`, `mandatory`, `yes`, `1`, `t` - Data sent between client and server is encrypted.
 
 ### Running as an MCP Server
 
