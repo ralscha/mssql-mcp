@@ -54,13 +54,13 @@ func runServer(ctx context.Context, cfg config.Config, server *mcp.Server) error
 	switch cfg.Transport {
 	case config.StdioTransport:
 		return server.Run(ctx, &mcp.StdioTransport{})
-	case config.SSETransport:
-		handler := mcp.NewSSEHandler(func(*http.Request) *mcp.Server {
+	case config.HTTPTransport:
+		handler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server {
 			return server
-		}, nil)
+		}, &mcp.StreamableHTTPOptions{Stateless: true})
 		mux := http.NewServeMux()
-		mux.Handle(cfg.SSEPath, handler)
-		log.Printf("mssql-mcp listening for SSE at http://%s%s", cfg.HTTPAddr, cfg.SSEPath)
+		mux.Handle(cfg.HTTPPath, handler)
+		log.Printf("mssql-mcp listening for stateless Streamable HTTP at http://%s%s", cfg.HTTPAddr, cfg.HTTPPath)
 		return http.ListenAndServe(cfg.HTTPAddr, mux)
 	default:
 		return cfg.Validate()

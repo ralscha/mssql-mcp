@@ -181,8 +181,8 @@ func writeDemoEnv(host, port string) error {
 		"MSSQL_MCP_SERVER_DIR": "../..",
 		"MSSQL_TRANSPORT":      "stdio",
 		"MSSQL_HTTP_ADDR":      ":8080",
-		"MSSQL_SSE_PATH":       "/sse",
-		"MSSQL_SSE_URL":        "http://localhost:8080/sse",
+		"MSSQL_HTTP_PATH":      "/mcp",
+		"MSSQL_HTTP_URL":       "http://localhost:8080/mcp",
 	}
 	order := []string{
 		"MSSQL_SERVER",
@@ -195,8 +195,8 @@ func writeDemoEnv(host, port string) error {
 		"MSSQL_ACCESS_LEVEL",
 		"MSSQL_TRANSPORT",
 		"MSSQL_HTTP_ADDR",
-		"MSSQL_SSE_PATH",
-		"MSSQL_SSE_URL",
+		"MSSQL_HTTP_PATH",
+		"MSSQL_HTTP_URL",
 		"MSSQL_MCP_SERVER_DIR",
 	}
 
@@ -296,10 +296,10 @@ func printInstructions(host, port string) {
   }
 }`)
 	fmt.Println()
-	fmt.Println("SSE option:")
+	fmt.Println("Streamable HTTP option:")
 	fmt.Println("Run the MCP server separately with:")
-	fmt.Println(`MSSQL_TRANSPORT=sse MSSQL_HTTP_ADDR=:8080 MSSQL_SSE_PATH=/sse go run ./cmd/mssql-mcp`)
-	fmt.Println("Then point an SSE-capable MCP client at http://localhost:8080/sse.")
+	fmt.Println(`MSSQL_TRANSPORT=http MSSQL_HTTP_ADDR=:8080 MSSQL_HTTP_PATH=/mcp go run ./cmd/mssql-mcp`)
+	fmt.Println("Then point a Streamable HTTP MCP client at http://localhost:8080/mcp.")
 	fmt.Println()
 	fmt.Println("Agent prompt:")
 	fmt.Println(`You are an operations detective for Northwind Relay. Use the mssql-northwind-relay MCP server to inspect the schema and data. Build a concise findings report that identifies the most important operational, financial, and data-quality risks. Include the SQL evidence behind each finding and recommend the next three actions.`)

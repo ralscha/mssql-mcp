@@ -97,7 +97,7 @@ func ensureEnv() error {
 	defaultEnv("MSSQL_ACCESS_LEVEL", "READONLY")
 	defaultEnv("MSSQL_TRANSPORT", "stdio")
 	defaultEnv("MSSQL_HTTP_ADDR", ":8080")
-	defaultEnv("MSSQL_SSE_PATH", "/sse")
+	defaultEnv("MSSQL_HTTP_PATH", "/mcp")
 	defaultEnv("OPENAI_MODEL", "gpt-4o-mini")
 	return nil
 }
@@ -106,17 +106,17 @@ func connectMCP(ctx context.Context) (*client.Client, error) {
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("MSSQL_TRANSPORT"))) {
 	case "", "stdio":
 		return connectStdioMCP(ctx)
-	case "sse":
-		return connectSSEMCP(ctx)
+	case "http":
+		return connectHTTPMCP(ctx)
 	default:
-		return nil, fmt.Errorf("unsupported MSSQL_TRANSPORT %q, expected stdio or sse", os.Getenv("MSSQL_TRANSPORT"))
+		return nil, fmt.Errorf("unsupported MSSQL_TRANSPORT %q, expected stdio or http", os.Getenv("MSSQL_TRANSPORT"))
 	}
 }
 
 func printMCPConnection() {
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("MSSQL_TRANSPORT"))) {
-	case "sse":
-		fmt.Printf("Connecting to mssql-mcp over SSE at %q for database %q.\n", sseEndpoint(), os.Getenv("MSSQL_DATABASE"))
+	case "http":
+		fmt.Printf("Connecting to mssql-mcp over Streamable HTTP at %q for database %q.\n", httpEndpoint(), os.Getenv("MSSQL_DATABASE"))
 	default:
 		fmt.Printf("Connecting to mssql-mcp over stdio in %q for database %q.\n", serverDir(), os.Getenv("MSSQL_DATABASE"))
 	}
@@ -162,15 +162,15 @@ func connectStdioMCP(ctx context.Context) (*client.Client, error) {
 	return c, nil
 }
 
-func connectSSEMCP(ctx context.Context) (*client.Client, error) {
-	endpoint := sseEndpoint()
-	c, err := client.NewSSEMCPClient(endpoint)
+func connectHTTPMCP(ctx context.Context) (*client.Client, error) {
+	endpoint := httpEndpoint()
+	c, err := client.NewStreamableHttpClient(endpoint)
 	if err != nil {
 		return nil, err
 	}
 	if err := c.Start(ctx); err != nil {
 		_ = c.Close()
-		return nil, fmt.Errorf("start SSE MCP client for %s: %w", endpoint, err)
+		return nil, fmt.Errorf("start Streamable HTTP MCP client for %s: %w", endpoint, err)
 	}
 
 	initRequest := mcp.InitializeRequest{}
@@ -188,8 +188,8 @@ func connectSSEMCP(ctx context.Context) (*client.Client, error) {
 	return c, nil
 }
 
-func sseEndpoint() string {
-	if endpoint := strings.TrimSpace(os.Getenv("MSSQL_SSE_URL")); endpoint != "" {
+func httpEndpoint() string {
+	if endpoint := strings.TrimSpace(os.Getenv("MSSQL_HTTP_URL")); endpoint != "" {
 		return endpoint
 	}
 
@@ -197,9 +197,9 @@ func sseEndpoint() string {
 	if addr == "" {
 		addr = ":8080"
 	}
-	path := strings.TrimSpace(os.Getenv("MSSQL_SSE_PATH"))
+	path := strings.TrimSpace(os.Getenv("MSSQL_HTTP_PATH"))
 	if path == "" {
-		path = "/sse"
+		path = "/mcp"
 	}
 	if !strings.HasPrefix(path, "/") {
 		path = "/" + path

@@ -18,7 +18,7 @@ const (
 	DDLRW    AccessLevel = "DDL-RW"
 
 	StdioTransport Transport = "stdio"
-	SSETransport   Transport = "sse"
+	HTTPTransport  Transport = "http"
 )
 
 type Config struct {
@@ -36,7 +36,7 @@ type Config struct {
 	RequireConfirmation    bool
 	Transport              Transport
 	HTTPAddr               string
-	SSEPath                string
+	HTTPPath               string
 }
 
 func ParseAccessLevel(s string) (AccessLevel, error) {
@@ -60,10 +60,10 @@ func ParseTransport(s string) (Transport, error) {
 		return StdioTransport, nil
 	case StdioTransport:
 		return StdioTransport, nil
-	case SSETransport:
-		return SSETransport, nil
+	case HTTPTransport:
+		return HTTPTransport, nil
 	default:
-		return "", fmt.Errorf("invalid MSSQL_TRANSPORT %q, expected stdio or sse", s)
+		return "", fmt.Errorf("invalid MSSQL_TRANSPORT %q, expected stdio or http", s)
 	}
 }
 
@@ -99,7 +99,7 @@ func Load() (Config, error) {
 		RequireConfirmation:    boolEnv("MSSQL_REQUIRE_CONFIRMATION", true),
 		Transport:              transport,
 		HTTPAddr:               stringEnv("MSSQL_HTTP_ADDR", ":8080"),
-		SSEPath:                stringEnv("MSSQL_SSE_PATH", "/sse"),
+		HTTPPath:               stringEnv("MSSQL_HTTP_PATH", "/mcp"),
 	}
 	return cfg, cfg.Validate()
 }
@@ -129,14 +129,14 @@ func (c Config) Validate() error {
 	if c.MaxRowsDefault <= 0 || c.MaxRowsDefault > 100000 {
 		return fmt.Errorf("MSSQL_MAX_ROWS_DEFAULT must be between 1 and 100000")
 	}
-	if c.Transport != StdioTransport && c.Transport != SSETransport {
-		return fmt.Errorf("MSSQL_TRANSPORT must be stdio or sse")
+	if c.Transport != StdioTransport && c.Transport != HTTPTransport {
+		return fmt.Errorf("MSSQL_TRANSPORT must be stdio or http")
 	}
 	if c.HTTPAddr == "" {
 		return fmt.Errorf("MSSQL_HTTP_ADDR is required")
 	}
-	if !strings.HasPrefix(c.SSEPath, "/") {
-		return fmt.Errorf("MSSQL_SSE_PATH must start with /")
+	if c.Transport == HTTPTransport && !strings.HasPrefix(c.HTTPPath, "/") {
+		return fmt.Errorf("MSSQL_HTTP_PATH must start with /")
 	}
 	return nil
 }
@@ -172,7 +172,7 @@ func (c Config) PublicSummary() map[string]any {
 		"requireConfirmation":    c.RequireConfirmation,
 		"transport":              c.Transport,
 		"httpAddr":               c.HTTPAddr,
-		"ssePath":                c.SSEPath,
+		"httpPath":               c.HTTPPath,
 	}
 }
 
