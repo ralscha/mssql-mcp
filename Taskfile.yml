@@ -15,6 +15,11 @@ tasks:
       - cd demos/supply-chain-detective && go fix ./...
       - cd demos/supply-chain-detective && go fmt ./...
 
+  build:
+    desc: Build the MSSQL MCP server
+    cmds:
+      - go build -o mssql-mcp{{exeExt}} ./cmd/mssql-mcp
+
   test:
     desc: Run all Go tests
     cmds:
@@ -107,4 +112,3 @@ tasks:
     cmds:
       - git tag {{.TAG}}
       - git push origin {{.TAG}}
-
