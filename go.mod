@@ -3,7 +3,7 @@ module mssql-mcp
 go 1.27.0
 
 require (
-	github.com/microsoft/go-mssqldb v1.10.0
+	github.com/microsoft/go-mssqldb v1.11.0
 	github.com/modelcontextprotocol/go-sdk v1.7.0
 )
 
