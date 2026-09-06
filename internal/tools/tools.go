@@ -2,9 +2,11 @@ package tools
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -107,10 +109,10 @@ type RowsOutput struct {
 }
 
 type SearchSchemaInput struct {
-	Query        string `json:"query"`
-	TableOffset  int    `json:"tableOffset"`
-	ColumnOffset int    `json:"columnOffset"`
-	Limit        int    `json:"limit"`
+	Query        string `json:"query,omitempty" jsonschema:"Name pattern; * is supported as a wildcard."`
+	TableOffset  int    `json:"tableOffset,omitempty" jsonschema:"Zero-based table result offset."`
+	ColumnOffset int    `json:"columnOffset,omitempty" jsonschema:"Zero-based column result offset."`
+	Limit        int    `json:"limit,omitempty" jsonschema:"Maximum results per category; defaults to 50 and is capped at 200."`
 }
 
 type SearchSchemaOutput struct {
@@ -172,6 +174,9 @@ ORDER BY c.column_id`, schema, table)
 	if err != nil {
 		return nil, DescribeTableOutput{}, err
 	}
+	if len(columns) == 0 {
+		return nil, DescribeTableOutput{}, fmt.Errorf("table %q was not found", in.Table)
+	}
 	pks, err := r.client.Query(ctx, `
 SELECT c.name AS [column], ic.key_ordinal AS [ordinal]
 FROM sys.indexes i
@@ -201,9 +206,9 @@ ORDER BY i.name, ic.key_ordinal`, schema, table)
 }
 
 type ListTableInput struct {
-	Schema string `json:"schema"`
-	Filter string `json:"filter"`
-	Limit  int    `json:"limit"`
+	Schema string `json:"schema,omitempty"`
+	Filter string `json:"filter,omitempty" jsonschema:"Table-name pattern; * is supported as a wildcard."`
+	Limit  int    `json:"limit,omitempty" jsonschema:"Maximum results; defaults to 200 and is capped at 1000."`
 }
 
 func (r *Registry) listTable(ctx context.Context, _ *mcp.CallToolRequest, in ListTableInput) (*mcp.CallToolResult, RowsOutput, error) {
@@ -240,14 +245,15 @@ func (r *Registry) listEnvironments(context.Context, *mcp.CallToolRequest, any) 
 
 type ProfileTableInput struct {
 	Table          string `json:"table"`
-	IncludeSamples bool   `json:"includeSamples"`
-	SampleSize     int    `json:"sampleSize"`
+	IncludeSamples bool   `json:"includeSamples,omitempty"`
+	SampleSize     int    `json:"sampleSize,omitempty" jsonschema:"Sample rows to return; defaults to 10 and is capped at 100."`
 }
 
 type ProfileTableOutput struct {
 	RowCount []map[string]any `json:"rowCount"`
 	Columns  []map[string]any `json:"columns"`
 	Samples  []map[string]any `json:"samples,omitempty"`
+	Warnings []string         `json:"warnings,omitempty"`
 }
 
 func (r *Registry) profileTable(ctx context.Context, _ *mcp.CallToolRequest, in ProfileTableInput) (*mcp.CallToolResult, ProfileTableOutput, error) {
@@ -277,6 +283,7 @@ ORDER BY c.column_id`, schema, table)
 		return nil, ProfileTableOutput{}, err
 	}
 	summaries := make([]map[string]any, 0, len(cols))
+	warnings := make([]string, 0)
 	for _, col := range cols {
 		name, _ := col["name"].(string)
 		qcol, err := sqlsafe.QuoteIdentifier(name)
@@ -284,7 +291,11 @@ ORDER BY c.column_id`, schema, table)
 			continue
 		}
 		stats, err := r.client.Query(ctx, fmt.Sprintf("SELECT COUNT_BIG(*) - COUNT(%s) AS [nullCount], COUNT_BIG(DISTINCT %s) AS [distinctCount], MIN(%s) AS [min], MAX(%s) AS [max] FROM %s", qcol, qcol, qcol, qcol, qname))
-		if err == nil && len(stats) > 0 {
+		if err != nil {
+			warnings = append(warnings, fmt.Sprintf("could not profile column %q: %v", name, err))
+			continue
+		}
+		if len(stats) > 0 {
 			stats[0]["name"] = name
 			stats[0]["dataType"] = col["dataType"]
 			summaries = append(summaries, stats[0])
@@ -298,7 +309,7 @@ ORDER BY c.column_id`, schema, table)
 			return nil, ProfileTableOutput{}, err
 		}
 	}
-	return nil, ProfileTableOutput{RowCount: rowCount, Columns: summaries, Samples: samples}, nil
+	return nil, ProfileTableOutput{RowCount: rowCount, Columns: summaries, Samples: samples, Warnings: warnings}, nil
 }
 
 type RelationshipsOutput struct {
@@ -366,15 +377,20 @@ ORDER BY s.name, o.name`, schema, table)
 }
 
 type QueryInput struct {
-	Query   string `json:"query"`
-	MaxRows int    `json:"maxRows"`
+	Query   string         `json:"query" jsonschema:"One T-SQL SELECT statement; named placeholders use @name syntax."`
+	Params  map[string]any `json:"params,omitempty" jsonschema:"Values for every named placeholder, keyed without @."`
+	MaxRows int            `json:"maxRows,omitempty" jsonschema:"Maximum rows to return, capped by MSSQL_MAX_ROWS_DEFAULT."`
 }
 
 func (r *Registry) readData(ctx context.Context, _ *mcp.CallToolRequest, in QueryInput) (*mcp.CallToolResult, RowsOutput, error) {
 	ctx, cancel := r.client.TimeoutContext(ctx)
 	defer cancel()
+	args, err := sqlsafe.BindNamedParameters(in.Query, in.Params)
+	if err != nil {
+		return nil, RowsOutput{}, err
+	}
 	maxRows := bounded(in.MaxRows, r.client.Config.MaxRowsDefault, r.client.Config.MaxRowsDefault)
-	rows, err := r.client.QueryReadOnly(ctx, in.Query, maxRows)
+	rows, err := r.client.QueryReadOnly(ctx, in.Query, maxRows, args...)
 	return nil, RowsOutput{Rows: rows}, err
 }
 
@@ -383,32 +399,27 @@ type ExplainOutput struct {
 }
 
 func (r *Registry) explainQuery(ctx context.Context, _ *mcp.CallToolRequest, in QueryInput) (*mcp.CallToolResult, ExplainOutput, error) {
-	if !sqlsafe.IsReadOnlyQuery(in.Query) {
-		return nil, ExplainOutput{}, fmt.Errorf("only read-only SELECT queries can be explained")
+	if err := sqlsafe.ValidateReadOnlyQuery(in.Query); err != nil {
+		return nil, ExplainOutput{}, fmt.Errorf("invalid read-only query: %w", err)
+	}
+	args, err := sqlsafe.BindNamedParameters(in.Query, in.Params)
+	if err != nil {
+		return nil, ExplainOutput{}, err
 	}
 	ctx, cancel := r.client.TimeoutContext(ctx)
 	defer cancel()
-	conn, err := r.client.DB.Conn(ctx)
-	if err != nil {
-		return nil, ExplainOutput{}, err
-	}
-	defer func() {
-		_ = conn.Close()
-	}()
-	if _, err := conn.ExecContext(ctx, "SET SHOWPLAN_XML ON"); err != nil {
-		return nil, ExplainOutput{}, err
-	}
-	defer func() {
-		_, _ = conn.ExecContext(context.Background(), "SET SHOWPLAN_XML OFF")
-	}()
-	rows, err := conn.QueryContext(ctx, in.Query)
-	if err != nil {
-		return nil, ExplainOutput{}, err
-	}
-	defer func() {
-		_ = rows.Close()
-	}()
-	plan, err := mssqldb.ScanRows(rows)
+	var plan []map[string]any
+	err = r.client.WithSessionSetting(ctx, "SET SHOWPLAN_XML ON", "SET SHOWPLAN_XML OFF", func(conn *sql.Conn) error {
+		rows, err := conn.QueryContext(ctx, in.Query, args...)
+		if err != nil {
+			return err
+		}
+		defer func() {
+			_ = rows.Close()
+		}()
+		plan, err = mssqldb.ScanRows(rows)
+		return err
+	})
 	return nil, ExplainOutput{Plan: plan}, err
 }
 
@@ -514,7 +525,6 @@ func (r *Registry) showCreateTable(ctx context.Context, _ *mcp.CallToolRequest, 
 	if err != nil {
 		return nil, DDLOutput{}, err
 	}
-
 	cols, err := r.client.Query(ctx, `
 SELECT c.name AS [name],
        CASE
@@ -541,6 +551,9 @@ WHERE s.name = @p1 AND tb.name = @p2
 ORDER BY c.column_id`, schema, table)
 	if err != nil {
 		return nil, DDLOutput{}, err
+	}
+	if len(cols) == 0 {
+		return nil, DDLOutput{}, fmt.Errorf("table %q was not found", in.Table)
 	}
 
 	colDefs := make([]string, 0, len(cols)+1)
@@ -648,9 +661,11 @@ func (r *Registry) insertData(ctx context.Context, _ *mcp.CallToolRequest, in In
 	if err != nil {
 		return nil, MutationOutput{}, err
 	}
-	ctx, cancel := r.client.TimeoutContext(ctx)
-	defer cancel()
-	var total int64
+	type insertStatement struct {
+		query string
+		args  []any
+	}
+	statements := make([]insertStatement, 0, len(in.Rows))
 	for _, row := range in.Rows {
 		cols := sortedKeys(row)
 		if len(cols) == 0 {
@@ -668,11 +683,35 @@ func (r *Registry) insertData(ctx context.Context, _ *mcp.CallToolRequest, in In
 			params[i] = fmt.Sprintf("@p%d", i+1)
 			args[i] = row[col]
 		}
-		n, err := r.client.Exec(ctx, fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)", table, strings.Join(qcols, ", "), strings.Join(params, ", ")), args...)
+		statements = append(statements, insertStatement{
+			query: fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)", table, strings.Join(qcols, ", "), strings.Join(params, ", ")),
+			args:  args,
+		})
+	}
+
+	ctx, cancel := r.client.TimeoutContext(ctx)
+	defer cancel()
+	tx, err := r.client.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, MutationOutput{}, err
+	}
+	defer func() {
+		_ = tx.Rollback()
+	}()
+	var total int64
+	for _, statement := range statements {
+		result, err := tx.ExecContext(ctx, statement.query, statement.args...)
+		if err != nil {
+			return nil, MutationOutput{}, err
+		}
+		n, err := result.RowsAffected()
 		if err != nil {
 			return nil, MutationOutput{}, err
 		}
 		total += n
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, MutationOutput{}, err
 	}
 	return nil, MutationOutput{Executed: true, RowsAffected: total}, nil
 }
@@ -681,8 +720,8 @@ type WhereMutationInput struct {
 	Table   string         `json:"table"`
 	Values  map[string]any `json:"values"`
 	Where   string         `json:"where"`
-	Params  map[string]any `json:"params"`
-	Confirm bool           `json:"confirm"`
+	Params  map[string]any `json:"params,omitempty" jsonschema:"Values for named placeholders in where, keyed without @."`
+	Confirm bool           `json:"confirm,omitempty"`
 }
 
 func (r *Registry) updateData(ctx context.Context, _ *mcp.CallToolRequest, in WhereMutationInput) (*mcp.CallToolResult, MutationOutput, error) {
@@ -692,37 +731,41 @@ func (r *Registry) updateData(ctx context.Context, _ *mcp.CallToolRequest, in Wh
 	if len(in.Values) == 0 {
 		return nil, MutationOutput{}, fmt.Errorf("values is required")
 	}
-	table, where, args, err := mutationTarget(in.Table, in.Where, in.Params)
+	cols := sortedKeys(in.Values)
+	set := make([]string, len(cols))
+	valueArgs := make([]any, 0, len(cols))
+	for i, col := range cols {
+		qcol, err := sqlsafe.QuoteIdentifier(col)
+		if err != nil {
+			return nil, MutationOutput{}, err
+		}
+		name := fmt.Sprintf("__mcp_value_%d", i+1)
+		set[i] = fmt.Sprintf("%s = @%s", qcol, name)
+		valueArgs = append(valueArgs, sql.Named(name, in.Values[col]))
+	}
+	table, where, whereArgs, err := mutationTarget(in.Table, in.Where, in.Params)
 	if err != nil {
 		return nil, MutationOutput{}, err
 	}
 	ctx, cancel := r.client.TimeoutContext(ctx)
 	defer cancel()
 	if r.client.Config.RequireConfirmation && !in.Confirm {
-		preview, err := r.client.Query(ctx, fmt.Sprintf("SELECT TOP (%d) * FROM %s WHERE %s", r.client.Config.MaxRowsDefault, table, where), args...)
+		preview, err := r.client.Query(ctx, fmt.Sprintf("SELECT TOP (%d) * FROM %s WHERE %s", r.client.Config.MaxRowsDefault, table, where), whereArgs...)
 		return nil, MutationOutput{Executed: false, Preview: preview}, err
 	}
-	cols := sortedKeys(in.Values)
-	set := make([]string, len(cols))
-	allArgs := make([]any, 0, len(cols)+len(args))
-	for i, col := range cols {
-		qcol, err := sqlsafe.QuoteIdentifier(col)
-		if err != nil {
-			return nil, MutationOutput{}, err
-		}
-		set[i] = fmt.Sprintf("%s = @p%d", qcol, i+1)
-		allArgs = append(allArgs, in.Values[col])
+	allArgs := append(valueArgs, whereArgs...)
+	n, err := r.client.Exec(ctx, fmt.Sprintf("UPDATE %s SET %s WHERE %s", table, strings.Join(set, ", "), where), allArgs...)
+	if err != nil {
+		return nil, MutationOutput{}, err
 	}
-	allArgs = append(allArgs, args...)
-	n, err := r.client.Exec(ctx, fmt.Sprintf("UPDATE %s SET %s WHERE %s", table, strings.Join(set, ", "), renumberWhere(where, len(cols))), allArgs...)
-	return nil, MutationOutput{Executed: true, RowsAffected: n}, err
+	return nil, MutationOutput{Executed: true, RowsAffected: n}, nil
 }
 
 type DeleteInput struct {
 	Table   string         `json:"table"`
 	Where   string         `json:"where"`
-	Params  map[string]any `json:"params"`
-	Confirm bool           `json:"confirm"`
+	Params  map[string]any `json:"params,omitempty" jsonschema:"Values for named placeholders in where, keyed without @."`
+	Confirm bool           `json:"confirm,omitempty"`
 }
 
 func (r *Registry) deleteData(ctx context.Context, _ *mcp.CallToolRequest, in DeleteInput) (*mcp.CallToolResult, MutationOutput, error) {
@@ -740,15 +783,18 @@ func (r *Registry) deleteData(ctx context.Context, _ *mcp.CallToolRequest, in De
 		return nil, MutationOutput{Executed: false, Preview: preview}, err
 	}
 	n, err := r.client.Exec(ctx, fmt.Sprintf("DELETE FROM %s WHERE %s", table, where), args...)
-	return nil, MutationOutput{Executed: true, RowsAffected: n}, err
+	if err != nil {
+		return nil, MutationOutput{}, err
+	}
+	return nil, MutationOutput{Executed: true, RowsAffected: n}, nil
 }
 
 type ColumnDef struct {
 	Name       string `json:"name"`
 	Type       string `json:"type"`
-	Nullable   bool   `json:"nullable"`
-	PrimaryKey bool   `json:"primaryKey"`
-	Identity   bool   `json:"identity"`
+	Nullable   bool   `json:"nullable,omitempty"`
+	PrimaryKey bool   `json:"primaryKey,omitempty"`
+	Identity   bool   `json:"identity,omitempty"`
 }
 
 type CreateTableInput struct {
@@ -769,15 +815,35 @@ func (r *Registry) createTable(ctx context.Context, _ *mcp.CallToolRequest, in C
 	}
 	defs := make([]string, 0, len(in.Columns)+1)
 	var pks []string
+	seenColumns := make(map[string]struct{}, len(in.Columns))
+	identityCount := 0
 	for _, col := range in.Columns {
 		qcol, err := sqlsafe.QuoteIdentifier(col.Name)
 		if err != nil {
 			return nil, MutationOutput{}, err
 		}
-		if !validSQLType(col.Type) {
-			return nil, MutationOutput{}, fmt.Errorf("invalid column type %q", col.Type)
+		columnKey := strings.ToLower(strings.TrimSpace(col.Name))
+		if _, duplicate := seenColumns[columnKey]; duplicate {
+			return nil, MutationOutput{}, fmt.Errorf("duplicate column %q", col.Name)
 		}
-		def := qcol + " " + col.Type
+		seenColumns[columnKey] = struct{}{}
+		typ, err := normalizeSQLType(col.Type)
+		if err != nil {
+			return nil, MutationOutput{}, err
+		}
+		if col.PrimaryKey && col.Nullable {
+			return nil, MutationOutput{}, fmt.Errorf("primary-key column %q cannot be nullable", col.Name)
+		}
+		if col.Identity {
+			identityCount++
+			if identityCount > 1 {
+				return nil, MutationOutput{}, fmt.Errorf("a table can have only one identity column")
+			}
+			if !identityTypeAllowed(typ) {
+				return nil, MutationOutput{}, fmt.Errorf("column %q has type %q, which cannot use IDENTITY", col.Name, typ)
+			}
+		}
+		def := qcol + " " + typ
 		if col.Identity {
 			def += " IDENTITY(1,1)"
 		}
@@ -797,14 +863,17 @@ func (r *Registry) createTable(ctx context.Context, _ *mcp.CallToolRequest, in C
 	ctx, cancel := r.client.TimeoutContext(ctx)
 	defer cancel()
 	n, err := r.client.Exec(ctx, fmt.Sprintf("CREATE TABLE %s (%s)", table, strings.Join(defs, ", ")))
-	return nil, MutationOutput{Executed: true, RowsAffected: n}, err
+	if err != nil {
+		return nil, MutationOutput{}, err
+	}
+	return nil, MutationOutput{Executed: true, RowsAffected: n}, nil
 }
 
 type CreateIndexInput struct {
 	Table   string   `json:"table"`
 	Name    string   `json:"name"`
 	Columns []string `json:"columns"`
-	Unique  bool     `json:"unique"`
+	Unique  bool     `json:"unique,omitempty"`
 }
 
 func (r *Registry) createIndex(ctx context.Context, _ *mcp.CallToolRequest, in CreateIndexInput) (*mcp.CallToolResult, MutationOutput, error) {
@@ -836,12 +905,15 @@ func (r *Registry) createIndex(ctx context.Context, _ *mcp.CallToolRequest, in C
 	ctx, cancel := r.client.TimeoutContext(ctx)
 	defer cancel()
 	n, err := r.client.Exec(ctx, fmt.Sprintf("%s %s ON %s (%s)", prefix, name, table, strings.Join(cols, ", ")))
-	return nil, MutationOutput{Executed: true, RowsAffected: n}, err
+	if err != nil {
+		return nil, MutationOutput{}, err
+	}
+	return nil, MutationOutput{Executed: true, RowsAffected: n}, nil
 }
 
 type DropTableInput struct {
 	Table   string `json:"table"`
-	Confirm bool   `json:"confirm"`
+	Confirm bool   `json:"confirm,omitempty"`
 }
 
 func (r *Registry) dropTable(ctx context.Context, _ *mcp.CallToolRequest, in DropTableInput) (*mcp.CallToolResult, MutationOutput, error) {
@@ -858,7 +930,10 @@ func (r *Registry) dropTable(ctx context.Context, _ *mcp.CallToolRequest, in Dro
 	ctx, cancel := r.client.TimeoutContext(ctx)
 	defer cancel()
 	n, err := r.client.Exec(ctx, "DROP TABLE "+table)
-	return nil, MutationOutput{Executed: true, RowsAffected: n}, err
+	if err != nil {
+		return nil, MutationOutput{}, err
+	}
+	return nil, MutationOutput{Executed: true, RowsAffected: n}, nil
 }
 
 func bounded(value, fallback, maxValue int) int {
@@ -907,10 +982,103 @@ func sortedKeys(m map[string]any) []string {
 	return keys
 }
 
-var sqlTypeRE = regexp.MustCompile(`(?i)^[A-Z][A-Z0-9 ]*(\([0-9]+(,[0-9]+)?|MAX\))?$`)
+var sqlTypeRE = regexp.MustCompile(`(?i)^([A-Z][A-Z0-9_]*)(?:\(([0-9]+|MAX)(?:,([0-9]+))?\))?$`)
 
-func validSQLType(s string) bool {
-	return sqlTypeRE.MatchString(strings.TrimSpace(s))
+var scalarSQLTypes = map[string]struct{}{
+	"bigint": {}, "bit": {}, "date": {}, "datetime": {}, "geography": {},
+	"geometry": {}, "hierarchyid": {}, "image": {}, "int": {}, "money": {},
+	"ntext": {}, "real": {}, "smalldatetime": {}, "smallint": {}, "smallmoney": {},
+	"sql_variant": {}, "sysname": {}, "text": {}, "timestamp": {}, "tinyint": {},
+	"uniqueidentifier": {}, "xml": {}, "rowversion": {},
+}
+
+func normalizeSQLType(value string) (string, error) {
+	typ := strings.ReplaceAll(strings.TrimSpace(value), " ", "")
+	match := sqlTypeRE.FindStringSubmatch(typ)
+	if match == nil {
+		return "", fmt.Errorf("invalid column type %q", value)
+	}
+	base := strings.ToLower(match[1])
+	first, second := strings.ToUpper(match[2]), match[3]
+	if _, ok := scalarSQLTypes[base]; ok {
+		if first != "" {
+			return "", fmt.Errorf("type %q does not accept a size", base)
+		}
+		return base, nil
+	}
+
+	switch base {
+	case "binary", "char", "nchar":
+		if err := requireLength(base, first, second, false); err != nil {
+			return "", err
+		}
+	case "varbinary", "varchar", "nvarchar":
+		if err := requireLength(base, first, second, true); err != nil {
+			return "", err
+		}
+	case "decimal", "numeric":
+		if first == "" || first == "MAX" {
+			return "", fmt.Errorf("type %q requires a precision from 1 to 38", base)
+		}
+		precision, _ := strconv.Atoi(first)
+		scale := 0
+		if second != "" {
+			scale, _ = strconv.Atoi(second)
+		}
+		if precision < 1 || precision > 38 || scale > precision {
+			return "", fmt.Errorf("invalid precision or scale for type %q", base)
+		}
+	case "datetime2", "datetimeoffset", "time":
+		if second != "" || first == "MAX" {
+			return "", fmt.Errorf("invalid precision for type %q", base)
+		}
+		if first != "" {
+			precision, _ := strconv.Atoi(first)
+			if precision > 7 {
+				return "", fmt.Errorf("type %q precision must be between 0 and 7", base)
+			}
+		}
+	case "float":
+		if second != "" || first == "MAX" {
+			return "", fmt.Errorf("invalid precision for type %q", base)
+		}
+		if first != "" {
+			precision, _ := strconv.Atoi(first)
+			if precision < 1 || precision > 53 {
+				return "", fmt.Errorf("type float precision must be between 1 and 53")
+			}
+		}
+	default:
+		return "", fmt.Errorf("unsupported column type %q", value)
+	}
+	return strings.ToLower(typ), nil
+}
+
+func requireLength(base, length, second string, allowMax bool) error {
+	if length == "" || second != "" || (length == "MAX" && !allowMax) {
+		return fmt.Errorf("type %q requires a valid length", base)
+	}
+	if length != "MAX" {
+		n, _ := strconv.Atoi(length)
+		if n < 1 || n > 8000 || ((base == "nvarchar" || base == "nchar") && n > 4000) {
+			return fmt.Errorf("invalid length for type %q", base)
+		}
+	}
+	return nil
+}
+
+func identityTypeAllowed(typ string) bool {
+	base := typ
+	arguments := ""
+	if index := strings.IndexByte(base, '('); index >= 0 {
+		arguments = strings.TrimSuffix(base[index+1:], ")")
+		base = base[:index]
+	}
+	if (base == "decimal" || base == "numeric") && strings.Contains(arguments, ",") && !strings.HasSuffix(arguments, ",0") {
+		return false
+	}
+	return base == "tinyint" || base == "smallint" || base == "int" || base == "bigint" ||
+		base == "decimal" || base == "numeric"
 }
 
 func mutationTarget(tableName, where string, params map[string]any) (string, string, []any, error) {
@@ -922,24 +1090,17 @@ func mutationTarget(tableName, where string, params map[string]any) (string, str
 	if where == "" {
 		return "", "", nil, fmt.Errorf("where is required")
 	}
-	if strings.Contains(where, ";") || !sqlsafe.IsReadOnlyQuery("SELECT * FROM x WHERE "+where) {
-		return "", "", nil, fmt.Errorf("where clause contains disallowed SQL")
+	if err := sqlsafe.ValidateReadOnlyQuery("SELECT * FROM x WHERE " + where); err != nil {
+		return "", "", nil, fmt.Errorf("where clause contains disallowed SQL: %w", err)
 	}
-	keys := sortedKeys(params)
-	args := make([]any, 0, len(keys))
-	for i, key := range keys {
-		if _, err := sqlsafe.QuoteIdentifier(key); err != nil {
-			return "", "", nil, err
+	for name := range params {
+		if strings.HasPrefix(strings.ToLower(name), "__mcp_") {
+			return "", "", nil, fmt.Errorf("parameter name %q uses the reserved __mcp_ prefix", name)
 		}
-		where = strings.ReplaceAll(where, "@"+key, fmt.Sprintf("@p%d", i+1))
-		args = append(args, params[key])
+	}
+	args, err := sqlsafe.BindNamedParameters(where, params)
+	if err != nil {
+		return "", "", nil, err
 	}
 	return table, where, args, nil
-}
-
-func renumberWhere(where string, offset int) string {
-	for i := 100; i >= 1; i-- {
-		where = strings.ReplaceAll(where, fmt.Sprintf("@p%d", i), fmt.Sprintf("@p%d", i+offset))
-	}
-	return where
 }

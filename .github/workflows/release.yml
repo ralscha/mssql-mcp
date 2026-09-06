@@ -24,6 +24,13 @@ jobs:
         with:
           go-version-file: go.mod
 
+      - name: Test server
+        run: go test ./...
+
+      - name: Test demo
+        working-directory: demos/supply-chain-detective
+        run: go test ./...
+
       - name: Run GoReleaser
         uses: goreleaser/goreleaser-action@v7
         with:

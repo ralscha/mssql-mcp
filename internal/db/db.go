@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"time"
 
@@ -50,38 +51,59 @@ func (c *Client) Query(ctx context.Context, query string, args ...any) ([]map[st
 	return ScanRows(rows)
 }
 
-func (c *Client) QueryReadOnly(ctx context.Context, query string, maxRows int) ([]map[string]any, error) {
-	if !sqlsafe.IsReadOnlyQuery(query) {
-		return nil, fmt.Errorf("only read-only SELECT queries are allowed")
+func (c *Client) QueryReadOnly(ctx context.Context, query string, maxRows int, args ...any) ([]map[string]any, error) {
+	if err := sqlsafe.ValidateReadOnlyQuery(query); err != nil {
+		return nil, fmt.Errorf("invalid read-only query: %w", err)
+	}
+	if c.Config.MaxRowsDefault <= 0 {
+		return nil, fmt.Errorf("maximum row limit must be positive")
 	}
 	if maxRows <= 0 || maxRows > c.Config.MaxRowsDefault {
 		maxRows = c.Config.MaxRowsDefault
 	}
-	if !sqlsafe.NeedsRowLimit(query) {
-		return c.Query(ctx, query)
-	}
+
+	var result []map[string]any
+	err := c.WithSessionSetting(ctx, fmt.Sprintf("SET ROWCOUNT %d", maxRows), "SET ROWCOUNT 0", func(conn *sql.Conn) error {
+		rows, err := conn.QueryContext(ctx, query, args...)
+		if err != nil {
+			return err
+		}
+		defer func() {
+			_ = rows.Close()
+		}()
+		result, err = ScanRows(rows)
+		return err
+	})
+	return result, err
+}
+
+// WithSessionSetting applies a connection-scoped setting for one operation and
+// reliably restores it before the connection is returned to the pool.
+func (c *Client) WithSessionSetting(ctx context.Context, enable, disable string, fn func(*sql.Conn) error) (err error) {
 	conn, err := c.DB.Conn(ctx)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	defer func() {
-		_ = conn.Close()
+		if closeErr := conn.Close(); closeErr != nil {
+			err = errors.Join(err, fmt.Errorf("close database connection: %w", closeErr))
+		}
 	}()
-	if _, err := conn.ExecContext(ctx, fmt.Sprintf("SET ROWCOUNT %d", maxRows)); err != nil {
-		return nil, err
+	if _, err := conn.ExecContext(ctx, enable); err != nil {
+		return fmt.Errorf("enable database session setting: %w", err)
 	}
 	defer func() {
-		_, _ = conn.ExecContext(context.Background(), "SET ROWCOUNT 0")
+		resetTimeout := min(c.Config.QueryTimeout, 5*time.Second)
+		if resetTimeout <= 0 {
+			resetTimeout = 5 * time.Second
+		}
+		resetCtx, cancel := context.WithTimeout(context.Background(), resetTimeout)
+		defer cancel()
+		if _, resetErr := conn.ExecContext(resetCtx, disable); resetErr != nil {
+			err = errors.Join(err, fmt.Errorf("restore database session setting: %w", resetErr))
+		}
 	}()
-
-	rows, err := conn.QueryContext(ctx, query)
-	if err != nil {
-		return nil, err
-	}
-	defer func() {
-		_ = rows.Close()
-	}()
-	return ScanRows(rows)
+	return fn(conn)
 }
 
 func (c *Client) Exec(ctx context.Context, query string, args ...any) (int64, error) {
@@ -101,6 +123,7 @@ func ScanRows(rows *sql.Rows) ([]map[string]any, error) {
 	if err != nil {
 		return nil, err
 	}
+	cols = uniqueColumnNames(cols)
 	out := []map[string]any{}
 	for rows.Next() {
 		raw := make([]any, len(cols))
@@ -118,6 +141,37 @@ func ScanRows(rows *sql.Rows) ([]map[string]any, error) {
 		out = append(out, row)
 	}
 	return out, rows.Err()
+}
+
+// uniqueColumnNames prevents duplicate SELECT labels from silently overwriting
+// values when a row is represented as a map.
+func uniqueColumnNames(columns []string) []string {
+	reserved := make(map[string]bool, len(columns))
+	for _, column := range columns {
+		reserved[column] = true
+	}
+	used := make(map[string]bool, len(columns))
+	nextSuffix := make(map[string]int, len(columns))
+	result := make([]string, len(columns))
+	for i, column := range columns {
+		if !used[column] {
+			result[i] = column
+			used[column] = true
+			continue
+		}
+		suffix := max(nextSuffix[column], 2)
+		for {
+			candidate := fmt.Sprintf("%s_%d", column, suffix)
+			suffix++
+			if !used[candidate] && !reserved[candidate] {
+				result[i] = candidate
+				used[candidate] = true
+				nextSuffix[column] = suffix
+				break
+			}
+		}
+	}
+	return result
 }
 
 func normalize(v any) any {

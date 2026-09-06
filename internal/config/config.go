@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"strconv"
@@ -84,19 +85,43 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	port, err := intEnv("MSSQL_PORT", 1433)
+	if err != nil {
+		return Config{}, err
+	}
+	trustServerCertificate, err := boolEnv("MSSQL_TRUST_SERVER_CERTIFICATE", false)
+	if err != nil {
+		return Config{}, err
+	}
+	connectionTimeout, err := durationSecondsEnv("MSSQL_CONNECTION_TIMEOUT", 30*time.Second)
+	if err != nil {
+		return Config{}, err
+	}
+	queryTimeout, err := durationSecondsEnv("MSSQL_QUERY_TIMEOUT", 120*time.Second)
+	if err != nil {
+		return Config{}, err
+	}
+	maxRowsDefault, err := intEnv("MSSQL_MAX_ROWS_DEFAULT", 1000)
+	if err != nil {
+		return Config{}, err
+	}
+	requireConfirmation, err := boolEnv("MSSQL_REQUIRE_CONFIRMATION", true)
+	if err != nil {
+		return Config{}, err
+	}
 	cfg := Config{
 		AccessLevel:            level,
-		Server:                 os.Getenv("MSSQL_SERVER"),
-		Database:               os.Getenv("MSSQL_DATABASE"),
-		Username:               os.Getenv("MSSQL_USERNAME"),
+		Server:                 strings.TrimSpace(os.Getenv("MSSQL_SERVER")),
+		Database:               strings.TrimSpace(os.Getenv("MSSQL_DATABASE")),
+		Username:               strings.TrimSpace(os.Getenv("MSSQL_USERNAME")),
 		Password:               os.Getenv("MSSQL_PASSWORD"),
-		Port:                   intEnv("MSSQL_PORT", 1433),
+		Port:                   port,
 		Encrypt:                stringEnv("MSSQL_ENCRYPT", "true"),
-		TrustServerCertificate: boolEnv("MSSQL_TRUST_SERVER_CERTIFICATE", false),
-		ConnectionTimeout:      durationSecondsEnv("MSSQL_CONNECTION_TIMEOUT", 30*time.Second),
-		QueryTimeout:           durationSecondsEnv("MSSQL_QUERY_TIMEOUT", 120*time.Second),
-		MaxRowsDefault:         intEnv("MSSQL_MAX_ROWS_DEFAULT", 1000),
-		RequireConfirmation:    boolEnv("MSSQL_REQUIRE_CONFIRMATION", true),
+		TrustServerCertificate: trustServerCertificate,
+		ConnectionTimeout:      connectionTimeout,
+		QueryTimeout:           queryTimeout,
+		MaxRowsDefault:         maxRowsDefault,
+		RequireConfirmation:    requireConfirmation,
 		Transport:              transport,
 		HTTPAddr:               stringEnv("MSSQL_HTTP_ADDR", ":8080"),
 		HTTPPath:               stringEnv("MSSQL_HTTP_PATH", "/mcp"),
@@ -105,13 +130,16 @@ func Load() (Config, error) {
 }
 
 func (c Config) Validate() error {
-	if c.Server == "" {
+	if c.AccessLevel != ReadOnly && c.AccessLevel != DMLRW && c.AccessLevel != DDLRW {
+		return fmt.Errorf("MSSQL_ACCESS_LEVEL must be READONLY, DML-RW, or DDL-RW")
+	}
+	if strings.TrimSpace(c.Server) == "" {
 		return fmt.Errorf("MSSQL_SERVER is required")
 	}
-	if c.Database == "" {
+	if strings.TrimSpace(c.Database) == "" {
 		return fmt.Errorf("MSSQL_DATABASE is required")
 	}
-	if c.Username == "" {
+	if strings.TrimSpace(c.Username) == "" {
 		return fmt.Errorf("MSSQL_USERNAME is required")
 	}
 	if c.Password == "" {
@@ -129,14 +157,21 @@ func (c Config) Validate() error {
 	if c.MaxRowsDefault <= 0 || c.MaxRowsDefault > 100000 {
 		return fmt.Errorf("MSSQL_MAX_ROWS_DEFAULT must be between 1 and 100000")
 	}
+	switch strings.ToLower(strings.TrimSpace(c.Encrypt)) {
+	case "mandatory", "yes", "1", "t", "true", "disable", "strict", "optional", "no", "0", "f", "false":
+	default:
+		return fmt.Errorf("MSSQL_ENCRYPT has an unsupported value %q", c.Encrypt)
+	}
 	if c.Transport != StdioTransport && c.Transport != HTTPTransport {
 		return fmt.Errorf("MSSQL_TRANSPORT must be stdio or http")
 	}
-	if c.HTTPAddr == "" {
-		return fmt.Errorf("MSSQL_HTTP_ADDR is required")
-	}
-	if c.Transport == HTTPTransport && !strings.HasPrefix(c.HTTPPath, "/") {
-		return fmt.Errorf("MSSQL_HTTP_PATH must start with /")
+	if c.Transport == HTTPTransport {
+		if strings.TrimSpace(c.HTTPAddr) == "" {
+			return fmt.Errorf("MSSQL_HTTP_ADDR is required for HTTP transport")
+		}
+		if c.HTTPPath == "" || !strings.HasPrefix(c.HTTPPath, "/") || strings.ContainsAny(c.HTTPPath, "{}?#\t\r\n ") {
+			return fmt.Errorf("MSSQL_HTTP_PATH must be an exact path starting with /")
+		}
 	}
 	return nil
 }
@@ -145,7 +180,7 @@ func (c Config) ConnectionString() string {
 	u := &url.URL{
 		Scheme: "sqlserver",
 		User:   url.UserPassword(c.Username, c.Password),
-		Host:   fmt.Sprintf("%s:%d", c.Server, c.Port),
+		Host:   net.JoinHostPort(c.Server, strconv.Itoa(c.Port)),
 	}
 	q := u.Query()
 	q.Set("database", c.Database)
@@ -183,24 +218,32 @@ func stringEnv(name, fallback string) string {
 	return fallback
 }
 
-func intEnv(name string, fallback int) int {
+func intEnv(name string, fallback int) (int, error) {
 	if v := strings.TrimSpace(os.Getenv(name)); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			return n
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return 0, fmt.Errorf("%s must be an integer: %w", name, err)
 		}
+		return n, nil
 	}
-	return fallback
+	return fallback, nil
 }
 
-func boolEnv(name string, fallback bool) bool {
+func boolEnv(name string, fallback bool) (bool, error) {
 	if v := strings.TrimSpace(os.Getenv(name)); v != "" {
-		if b, err := strconv.ParseBool(v); err == nil {
-			return b
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return false, fmt.Errorf("%s must be a boolean: %w", name, err)
 		}
+		return b, nil
 	}
-	return fallback
+	return fallback, nil
 }
 
-func durationSecondsEnv(name string, fallback time.Duration) time.Duration {
-	return time.Duration(intEnv(name, int(fallback.Seconds()))) * time.Second
+func durationSecondsEnv(name string, fallback time.Duration) (time.Duration, error) {
+	seconds, err := intEnv(name, int(fallback.Seconds()))
+	if err != nil {
+		return 0, err
+	}
+	return time.Duration(seconds) * time.Second, nil
 }

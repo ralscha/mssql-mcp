@@ -6,8 +6,11 @@ An [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) server that 
 
 - **23 MCP tools** covering schema search, table description, data profiling, relationship/dependency inspection, object listing, DDL inspection, query explanation, connection testing, and tiered write access
 - **Tiered access model** via `MSSQL_ACCESS_LEVEL`: `READONLY` (default), `DML-RW` (adds insert/update/delete), `DDL-RW` (adds create/drop table/index)
-- **SQL-safe design** with identifier quoting, multipart name validation, and read-only query enforcement
-- **Read-only query guard** that rejects mutating statements (`INSERT`, `UPDATE`, `DELETE`, `MERGE`, `CREATE`, `ALTER`, `DROP`, `TRUNCATE`, `EXEC`, etc.) on the `read_data` tool
+- **SQL-safe design** with identifier quoting, exact named-parameter binding, multipart name validation, and read-only query enforcement
+- **Read-only query guard** that rejects multiple statements and mutating constructs (`SELECT INTO`, `INSERT`, `UPDATE`, `DELETE`, `MERGE`, `CREATE`, `ALTER`, `DROP`, `TRUNCATE`, `EXEC`, etc.) on the `read_data` tool
+- **Hard result limits** that cap every `read_data` call even when the query contains its own `TOP` or `OFFSET`
+- **Lossless row mapping** that disambiguates duplicate result-column labels instead of overwriting values
+- **Atomic multi-row inserts** that roll back the entire `insert_data` call if any row fails
 - **Mutation confirmation** with preview mode that shows affected rows before executing writes when `MSSQL_REQUIRE_CONFIRMATION` is enabled
 - **Explain plan** via `SHOWPLAN_XML` for understanding query performance
 - **Connection testing** that validates connectivity and reports latency
@@ -16,6 +19,8 @@ An [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) server that 
 ## Installation
 
 Download the latest release for your platform from the [Releases](https://github.com/ralscha/mssql-mcp/releases) page. 
+
+Print the installed build version with `mssql-mcp --version`.
 
 ## Usage
 
@@ -116,11 +121,24 @@ Mutations (`update_data`, `delete_data`, `drop_table`) require a `"confirm": tru
 | `show_create_table` | Generate a CREATE TABLE statement for an existing table |
 | `table_size` | Report estimated row counts and table/index size in KB |
 
+`read_data` and `explain_query` support named parameters. Placeholders are checked exactly outside SQL strings and comments, and every supplied parameter must be used:
+
+```json
+{
+  "query": "SELECT * FROM dbo.Orders WHERE status = @status AND created_at >= @since",
+  "params": {
+    "status": "Open",
+    "since": "2026-01-01"
+  },
+  "maxRows": 100
+}
+```
+
 ### DML (DML-RW)
 
 | Tool | Description |
 |------|-------------|
-| `insert_data` | Insert one or more rows into a table |
+| `insert_data` | Atomically insert one or more rows into a table |
 | `update_data` | Update rows matching a WHERE clause (with optional preview) |
 | `delete_data` | Delete rows matching a WHERE clause (with optional preview) |
 

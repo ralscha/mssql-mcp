@@ -78,6 +78,7 @@ func TestValidateTransportConfig(t *testing.T) {
 		Database:            "db",
 		Username:            "sa",
 		Password:            "password",
+		Encrypt:             "true",
 		ConnectionTimeout:   1,
 		QueryTimeout:        1,
 		MaxRowsDefault:      1,
@@ -94,13 +95,14 @@ func TestValidateTransportConfig(t *testing.T) {
 	if err := cfg.Validate(); err == nil {
 		t.Fatal("Validate() expected error for HTTP path without leading slash")
 	}
+	cfg.HTTPPath = "/mcp/{session}"
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("Validate() expected error for HTTP wildcard path")
+	}
 }
 
 func TestLoadEncryptDefaultsTrue(t *testing.T) {
-	t.Setenv("MSSQL_SERVER", "localhost")
-	t.Setenv("MSSQL_DATABASE", "db")
-	t.Setenv("MSSQL_USERNAME", "sa")
-	t.Setenv("MSSQL_PASSWORD", "password")
+	setRequiredEnvironment(t)
 
 	cfg, err := Load()
 	if err != nil {
@@ -112,10 +114,7 @@ func TestLoadEncryptDefaultsTrue(t *testing.T) {
 }
 
 func TestLoadEncryptString(t *testing.T) {
-	t.Setenv("MSSQL_SERVER", "localhost")
-	t.Setenv("MSSQL_DATABASE", "db")
-	t.Setenv("MSSQL_USERNAME", "sa")
-	t.Setenv("MSSQL_PASSWORD", "password")
+	setRequiredEnvironment(t)
 	t.Setenv("MSSQL_ENCRYPT", "strict")
 
 	cfg, err := Load()
@@ -144,5 +143,103 @@ func TestConnectionStringEncrypt(t *testing.T) {
 	}
 	if got := u.Query().Get("encrypt"); got != "disable" {
 		t.Fatalf("ConnectionString() encrypt = %q, want disable", got)
+	}
+}
+
+func TestConnectionStringIPv6(t *testing.T) {
+	cfg := Config{
+		Server:            "2001:db8::1",
+		Port:              1433,
+		Database:          "db",
+		Username:          "sa",
+		Password:          "password",
+		Encrypt:           "true",
+		ConnectionTimeout: 30 * time.Second,
+	}
+	u, err := url.Parse(cfg.ConnectionString())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := u.Host; got != "[2001:db8::1]:1433" {
+		t.Fatalf("host = %q", got)
+	}
+}
+
+func TestLoadRejectsMalformedEnvironmentValues(t *testing.T) {
+	tests := []struct {
+		name  string
+		value string
+	}{
+		{"MSSQL_PORT", "not-a-number"},
+		{"MSSQL_CONNECTION_TIMEOUT", "soon"},
+		{"MSSQL_QUERY_TIMEOUT", "later"},
+		{"MSSQL_MAX_ROWS_DEFAULT", "many"},
+		{"MSSQL_TRUST_SERVER_CERTIFICATE", "sometimes"},
+		{"MSSQL_REQUIRE_CONFIRMATION", "perhaps"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			setRequiredEnvironment(t)
+			t.Setenv(tt.name, tt.value)
+			if _, err := Load(); err == nil {
+				t.Fatal("expected an error")
+			}
+		})
+	}
+}
+
+func TestValidateRejectsInvalidEnums(t *testing.T) {
+	cfg := validConfig()
+	cfg.AccessLevel = "ADMIN"
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected invalid access-level error")
+	}
+
+	cfg = validConfig()
+	cfg.Encrypt = "maybe"
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected invalid encryption error")
+	}
+}
+
+func TestValidateAllowsEmptyHTTPSettingsForStdio(t *testing.T) {
+	cfg := validConfig()
+	cfg.HTTPAddr = ""
+	cfg.HTTPPath = ""
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() unexpected error: %v", err)
+	}
+}
+
+func setRequiredEnvironment(t *testing.T) {
+	t.Helper()
+	t.Setenv("MSSQL_SERVER", "localhost")
+	t.Setenv("MSSQL_DATABASE", "db")
+	t.Setenv("MSSQL_USERNAME", "sa")
+	t.Setenv("MSSQL_PASSWORD", "password")
+	for _, name := range []string{
+		"MSSQL_PORT", "MSSQL_CONNECTION_TIMEOUT", "MSSQL_QUERY_TIMEOUT", "MSSQL_MAX_ROWS_DEFAULT",
+		"MSSQL_TRUST_SERVER_CERTIFICATE", "MSSQL_REQUIRE_CONFIRMATION", "MSSQL_ACCESS_LEVEL",
+		"MSSQL_ENCRYPT", "MSSQL_TRANSPORT", "MSSQL_HTTP_ADDR", "MSSQL_HTTP_PATH",
+	} {
+		t.Setenv(name, "")
+	}
+}
+
+func validConfig() Config {
+	return Config{
+		AccessLevel:            ReadOnly,
+		Server:                 "localhost",
+		Port:                   1433,
+		Database:               "db",
+		Username:               "sa",
+		Password:               "password",
+		Encrypt:                "true",
+		ConnectionTimeout:      time.Second,
+		QueryTimeout:           time.Second,
+		MaxRowsDefault:         1000,
+		RequireConfirmation:    true,
+		Transport:              StdioTransport,
+		TrustServerCertificate: false,
 	}
 }

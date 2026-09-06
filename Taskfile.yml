@@ -27,10 +27,10 @@ tasks:
       - cd demos/supply-chain-detective && go test ./...
 
   lint:
-    desc: Run golangci-lint in a Docker container
+    desc: Run golangci-lint for the server and demo
     cmds:
-      - golangci-lint run -v --timeout 5m
-      - docker run --rm -v {{toSlash .ROOT_DIR}}:/app -w /app/demos/supply-chain-detective golangci/golangci-lint:v2.13.2 golangci-lint run -v --timeout 5m
+      - golangci-lint run -v --timeout 5m ./...
+      - docker run --rm -v {{toSlash .ROOT_DIR}}:/app -w /app/demos/supply-chain-detective golangci/golangci-lint:v2.13.2 golangci-lint run -v --timeout 5m ./...
 
   demo:
     desc: Show how to run the Supply Chain Detective demo

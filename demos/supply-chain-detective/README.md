@@ -9,7 +9,7 @@ The data is for a fictional company, Northwind Relay. It includes vendors, wareh
 Prerequisites:
 
 - Docker Desktop or another Docker-compatible runtime
-- Go 1.26+
+- Go 1.27.1+
 
 ```bash
 cd demos/supply-chain-detective
