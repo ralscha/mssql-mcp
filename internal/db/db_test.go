@@ -57,7 +57,7 @@ func TestUniqueColumnNamesPreservesEveryValue(t *testing.T) {
 
 func openRecordingDB(t *testing.T, name string, conn *recordingConn) *sql.DB {
 	t.Helper()
-	name = fmt.Sprintf("%s-%d", name, atomic.AddUint64(&recordingDriverID, 1))
+	name = fmt.Sprintf("%s-%d", name, recordingDriverID.Add(1))
 	sql.Register(name, &recordingDriver{conn: conn})
 	db, err := sql.Open(name, "")
 	if err != nil {
@@ -67,7 +67,7 @@ func openRecordingDB(t *testing.T, name string, conn *recordingConn) *sql.DB {
 	return db
 }
 
-var recordingDriverID uint64
+var recordingDriverID atomic.Uint64
 
 type recordingDriver struct {
 	conn *recordingConn

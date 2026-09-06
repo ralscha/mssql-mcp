@@ -223,7 +223,7 @@ func TestInsertDataUsesAtomicTransaction(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			conn := &transactionRecordingConn{failAt: tt.failAt}
-			driverName := fmt.Sprintf("insert-transaction-%d", atomic.AddUint64(&testDriverID, 1))
+			driverName := fmt.Sprintf("insert-transaction-%d", testDriverID.Add(1))
 			sql.Register(driverName, &transactionRecordingDriver{conn: conn})
 			database, err := sql.Open(driverName, "")
 			if err != nil {
@@ -258,7 +258,7 @@ func TestInsertDataUsesAtomicTransaction(t *testing.T) {
 	}
 }
 
-var testDriverID uint64
+var testDriverID atomic.Uint64
 
 type transactionRecordingDriver struct {
 	conn *transactionRecordingConn
