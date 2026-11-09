@@ -10,8 +10,8 @@ require (
 	github.com/joho/godotenv v1.5.1
 	github.com/mark3labs/mcp-go v1.5.0
 	github.com/microsoft/go-mssqldb v1.11.2
-	github.com/testcontainers/testcontainers-go v0.44.0
-	github.com/testcontainers/testcontainers-go/modules/mssql v0.44.0
+	github.com/testcontainers/testcontainers-go v0.45.0
+	github.com/testcontainers/testcontainers-go/modules/mssql v0.45.0
 )
 
 require (
