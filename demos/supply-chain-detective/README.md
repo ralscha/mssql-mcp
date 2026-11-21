@@ -43,14 +43,14 @@ The client loads `.env`, starts `go run ./cmd/mssql-mcp` over stdio by default, 
 To use stateless Streamable HTTP for the demo client, start the MCP server separately from the repository root:
 
 ```bash
-MSSQL_TRANSPORT=http MSSQL_HTTP_ADDR=:8080 MSSQL_HTTP_PATH=/mcp go run ./cmd/mssql-mcp
+MSSQL_TRANSPORT=http MSSQL_HTTP_ADDR=127.0.0.1:8080 MSSQL_HTTP_PATH=/mcp go run ./cmd/mssql-mcp
 ```
 
 Then set these values in `demos/supply-chain-detective/.env` before running `go run ./client`:
 
 ```text
 MSSQL_TRANSPORT=http
-MSSQL_HTTP_URL=http://localhost:8080/mcp
+MSSQL_HTTP_URL=http://127.0.0.1:8080/mcp
 ```
 
 The client prints a transcript as it runs: the user prompt, available MCP tools, assistant tool calls, MCP tool results, token usage metadata when available, and the final answer.

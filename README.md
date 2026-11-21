@@ -4,10 +4,10 @@ An [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) server that 
 
 ## Features
 
-- **23 MCP tools** covering schema search, table description, data profiling, relationship/dependency inspection, object listing, DDL inspection, query explanation, connection testing, and tiered write access
-- **Tiered access model** via `MSSQL_ACCESS_LEVEL`: `READONLY` (default), `DML-RW` (adds insert/update/delete), `DDL-RW` (adds create/drop table/index)
-- **SQL-safe design** with identifier quoting, exact named-parameter binding, multipart name validation, and read-only query enforcement
-- **Read-only query guard** that rejects multiple statements and mutating constructs (`SELECT INTO`, `INSERT`, `UPDATE`, `DELETE`, `MERGE`, `CREATE`, `ALTER`, `DROP`, `TRUNCATE`, `EXEC`, etc.) on the `read_data` tool
+- **22 MCP tools** covering schema search, table description, data profiling, relationship/dependency inspection, object listing, DDL inspection, query explanation, connection testing, and tiered write access
+- **Tiered access model** via `MSSQL_ACCESS_LEVEL`: `READONLY` (default), `DML-RW` (adds insert/update/delete), `DDL-RW` (adds create/drop table/index); pair `READONLY` with a read-only SQL Server login for defense-in-depth in production
+- **SQL-safe design** with identifier quoting, exact named-parameter binding, single-database table validation, and read-only query enforcement
+- **Read-only query guard** that rejects multiple statements (with or without semicolons) and mutating or locking constructs (`SELECT INTO`, `INSERT`, `UPDATE`, `DELETE`, `MERGE`, `CREATE`, `ALTER`, `DROP`, `TRUNCATE`, `EXEC`, `DISABLE`, `RECEIVE`, `XLOCK`, etc.) on `read_data` and `explain_query`
 - **Hard result limits** that cap every `read_data` call even when the query contains its own `TOP` or `OFFSET`
 - **Lossless row mapping** that disambiguates duplicate result-column labels instead of overwriting values
 - **Atomic multi-row inserts** that roll back the entire `insert_data` call if any row fails
@@ -28,11 +28,11 @@ Print the installed build version with `mssql-mcp --version`.
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `MSSQL_SERVER` | Yes | - | SQL Server hostname or IP |
+| `MSSQL_SERVER` | Yes | - | SQL Server hostname, IP, or `host\instance` |
 | `MSSQL_DATABASE` | Yes | - | Database name |
 | `MSSQL_USERNAME` | Yes | - | Login username |
 | `MSSQL_PASSWORD` | Yes | - | Login password |
-| `MSSQL_PORT` | No | `1433` | SQL Server port |
+| `MSSQL_PORT` | No | `1433` (`0` for `host\instance`) | SQL Server port |
 | `MSSQL_ACCESS_LEVEL` | No | `READONLY` | `READONLY`, `DML-RW`, or `DDL-RW` |
 | `MSSQL_ENCRYPT` | No | `true` | SQL Server driver encryption setting |
 | `MSSQL_TRUST_SERVER_CERTIFICATE` | No | `false` | Trust self-signed certificates |
@@ -41,8 +41,9 @@ Print the installed build version with `mssql-mcp --version`.
 | `MSSQL_MAX_ROWS_DEFAULT` | No | `1000` | Default row limit for queries |
 | `MSSQL_REQUIRE_CONFIRMATION` | No | `true` | Require confirm flag for writes |
 | `MSSQL_TRANSPORT` | No | `stdio` | MCP transport: `stdio` or `http` |
-| `MSSQL_HTTP_ADDR` | No | `:8080` | HTTP listen address when `MSSQL_TRANSPORT=http` |
+| `MSSQL_HTTP_ADDR` | No | `127.0.0.1:8080` | HTTP listen address when `MSSQL_TRANSPORT=http` |
 | `MSSQL_HTTP_PATH` | No | `/mcp` | Stateless Streamable HTTP endpoint path when `MSSQL_TRANSPORT=http` |
+| `MSSQL_HTTP_BEARER_TOKEN` | No | - | Optional Bearer token required on HTTP requests when `MSSQL_TRANSPORT=http` |
 
 `MSSQL_ENCRYPT` is passed through to the SQL Server driver as the `encrypt` connection parameter. Supported values include:
 
@@ -78,7 +79,7 @@ To serve MCP using the stateless Streamable HTTP transport, set `MSSQL_TRANSPORT
 
 ```bash
 MSSQL_TRANSPORT=http \
-MSSQL_HTTP_ADDR=:8080 \
+MSSQL_HTTP_ADDR=127.0.0.1:8080 \
 MSSQL_HTTP_PATH=/mcp \
 /path/to/bin/mssql-mcp
 ```
@@ -86,14 +87,14 @@ MSSQL_HTTP_PATH=/mcp \
 Then configure a Streamable HTTP MCP client to connect to:
 
 ```text
-http://localhost:8080/mcp
+http://127.0.0.1:8080/mcp
 ```
 
 ### Access Levels
 
-- **`READONLY`** (default) - Schema exploration, object listing, data reading, profiling, relationship inspection, DDL inspection, query explanation, connection testing. 17 tools.
-- **`DML-RW`** - All read-only tools plus `insert_data`, `update_data`, `delete_data`. 20 tools.
-- **`DDL-RW`** - All DML tools plus `create_table`, `create_index`, `drop_table`. 23 tools.
+- **`READONLY`** (default) - Schema exploration, object listing, data reading, profiling, relationship inspection, DDL inspection, query explanation, connection testing. 16 tools.
+- **`DML-RW`** - All read-only tools plus `insert_data`, `update_data`, `delete_data`. 19 tools.
+- **`DDL-RW`** - All DML tools plus `create_table`, `create_index`, `drop_table`. 22 tools.
 
 Mutations (`update_data`, `delete_data`, `drop_table`) require a `"confirm": true` flag when `MSSQL_REQUIRE_CONFIRMATION` is enabled (the default). Without confirmation, the server returns a preview of the affected rows instead.
 
@@ -113,13 +114,12 @@ Mutations (`update_data`, `delete_data`, `drop_table`) require a `"confirm": tru
 | `inspect_dependencies` | Find objects (views, procedures, functions) that depend on a table |
 | `explain_query` | Get the XML execution plan for a read-only query |
 | `read_data` | Execute a read-only SELECT query with row limits |
-| `test_connection` | Ping the server and return latency and server version info |
-| `validate_environment_config` | Validate that all environment variables are correctly configured |
+| `test_connection` | Verify connectivity and return latency and server version info |
 | `list_schemas` | List database schemas and owners |
-| `list_views` | List views and their definitions |
-| `list_triggers` | List table triggers, events, timing, and definitions |
+| `list_views` | List views and their definitions, with optional schema/name filtering |
+| `list_triggers` | List table triggers, events, timing, and definitions, with optional filtering |
 | `show_create_table` | Generate a CREATE TABLE statement for an existing table |
-| `table_size` | Report estimated row counts and table/index size in KB |
+| `table_size` | Report estimated row counts and table/index size in KB, with optional filtering |
 
 `read_data` and `explain_query` support named parameters. Placeholders are checked exactly outside SQL strings and comments, and every supplied parameter must be used:
 
@@ -133,6 +133,10 @@ Mutations (`update_data`, `delete_data`, `drop_table`) require a `"confirm": tru
   "maxRows": 100
 }
 ```
+
+Integer parameters are bound as `bigint`. JSON numbers lose precision beyond ±2^53 before they reach the server, so pass larger integers as strings (for example `"9007199254740993"`); SQL Server converts them when comparing against `bigint` or `decimal` columns.
+
+With `MSSQL_TRANSPORT=http`, the server logs a warning at startup if `MSSQL_HTTP_ADDR` accepts non-local connections and `MSSQL_HTTP_BEARER_TOKEN` is not set.
 
 ### DML (DML-RW)
 

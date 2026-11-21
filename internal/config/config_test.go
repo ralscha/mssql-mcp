@@ -147,21 +147,64 @@ func TestConnectionStringEncrypt(t *testing.T) {
 }
 
 func TestConnectionStringIPv6(t *testing.T) {
-	cfg := Config{
-		Server:            "2001:db8::1",
-		Port:              1433,
-		Database:          "db",
-		Username:          "sa",
-		Password:          "password",
-		Encrypt:           "true",
-		ConnectionTimeout: 30 * time.Second,
+	for _, host := range []string{"2001:db8::1", "[2001:db8::1]"} {
+		cfg := Config{
+			Server:            host,
+			Port:              1433,
+			Database:          "db",
+			Username:          "sa",
+			Password:          "password",
+			Encrypt:           "true",
+			ConnectionTimeout: 30 * time.Second,
+		}
+		u, err := url.Parse(cfg.ConnectionString())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := u.Host; got != "[2001:db8::1]:1433" {
+			t.Fatalf("host(%q) = %q", host, got)
+		}
+	}
+}
+
+func TestConnectionStringNamedInstance(t *testing.T) {
+	setRequiredEnvironment(t)
+	t.Setenv("MSSQL_SERVER", `dbhost\SQLEXPRESS`)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() unexpected error: %v", err)
+	}
+	if cfg.Port != 0 {
+		t.Fatalf("Port = %d, want 0 for named instance without MSSQL_PORT", cfg.Port)
+	}
+	if cfg.HTTPAddr != "127.0.0.1:8080" {
+		t.Fatalf("HTTPAddr = %q, want 127.0.0.1:8080", cfg.HTTPAddr)
 	}
 	u, err := url.Parse(cfg.ConnectionString())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := u.Host; got != "[2001:db8::1]:1433" {
-		t.Fatalf("host = %q", got)
+	if u.Host != "dbhost" || u.Path != "/SQLEXPRESS" {
+		t.Fatalf("url host=%q path=%q", u.Host, u.Path)
+	}
+}
+
+func TestHTTPListensBeyondLoopback(t *testing.T) {
+	tests := map[string]bool{
+		"127.0.0.1:8080": false,
+		"[::1]:8080":     false,
+		"localhost:8080": false,
+		":8080":          true,
+		"0.0.0.0:8080":   true,
+		"[::]:8080":      true,
+		"10.0.0.5:8080":  true,
+		"myhost:8080":    true,
+	}
+	for addr, want := range tests {
+		if got := (Config{HTTPAddr: addr}).HTTPListensBeyondLoopback(); got != want {
+			t.Errorf("HTTPListensBeyondLoopback(%q) = %v, want %v", addr, got, want)
+		}
 	}
 }
 
@@ -220,7 +263,7 @@ func setRequiredEnvironment(t *testing.T) {
 	for _, name := range []string{
 		"MSSQL_PORT", "MSSQL_CONNECTION_TIMEOUT", "MSSQL_QUERY_TIMEOUT", "MSSQL_MAX_ROWS_DEFAULT",
 		"MSSQL_TRUST_SERVER_CERTIFICATE", "MSSQL_REQUIRE_CONFIRMATION", "MSSQL_ACCESS_LEVEL",
-		"MSSQL_ENCRYPT", "MSSQL_TRANSPORT", "MSSQL_HTTP_ADDR", "MSSQL_HTTP_PATH",
+		"MSSQL_ENCRYPT", "MSSQL_TRANSPORT", "MSSQL_HTTP_ADDR", "MSSQL_HTTP_PATH", "MSSQL_HTTP_BEARER_TOKEN",
 	} {
 		t.Setenv(name, "")
 	}

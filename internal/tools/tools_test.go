@@ -27,20 +27,20 @@ func TestToolNamesForLevel(t *testing.T) {
 		{config.ReadOnly, []string{
 			"search_schema", "describe_table", "list_table", "list_databases", "list_environments",
 			"profile_table", "inspect_relationships", "inspect_dependencies", "explain_query",
-			"read_data", "test_connection", "validate_environment_config",
+			"read_data", "test_connection",
 			"list_schemas", "list_views", "list_triggers", "show_create_table", "table_size",
 		}},
 		{config.DMLRW, []string{
 			"search_schema", "describe_table", "list_table", "list_databases", "list_environments",
 			"profile_table", "inspect_relationships", "inspect_dependencies", "explain_query",
-			"read_data", "test_connection", "validate_environment_config",
+			"read_data", "test_connection",
 			"list_schemas", "list_views", "list_triggers", "show_create_table", "table_size",
 			"insert_data", "update_data", "delete_data",
 		}},
 		{config.DDLRW, []string{
 			"search_schema", "describe_table", "list_table", "list_databases", "list_environments",
 			"profile_table", "inspect_relationships", "inspect_dependencies", "explain_query",
-			"read_data", "test_connection", "validate_environment_config",
+			"read_data", "test_connection",
 			"list_schemas", "list_views", "list_triggers", "show_create_table", "table_size",
 			"insert_data", "update_data", "delete_data",
 			"create_table", "create_index", "drop_table",
@@ -54,11 +54,21 @@ func TestToolNamesForLevel(t *testing.T) {
 	}
 }
 
-func TestToolDescriptionsForAllTools(t *testing.T) {
+func TestToolDescriptionsAndAnnotationsForAllTools(t *testing.T) {
+	readOnlySet := make(map[string]bool)
+	for _, name := range ToolNamesForLevel(config.ReadOnly) {
+		readOnlySet[name] = true
+	}
 	for _, name := range ToolNamesForLevel(config.DDLRW) {
 		tool := (&Registry{}).tool(name)
 		if strings.TrimSpace(tool.Description) == "" {
 			t.Fatalf("tool %q has no description", name)
+		}
+		if tool.Annotations == nil {
+			t.Fatalf("tool %q has no annotations", name)
+		}
+		if tool.Annotations.ReadOnlyHint != readOnlySet[name] {
+			t.Fatalf("tool %q ReadOnlyHint = %v, want %v", name, tool.Annotations.ReadOnlyHint, readOnlySet[name])
 		}
 	}
 }
@@ -138,7 +148,14 @@ func TestMutationTarget(t *testing.T) {
 }
 
 func TestMutationTargetRejectsUnsafeWhere(t *testing.T) {
-	bad := []string{"", "1=1; DROP TABLE Users", "id IN (SELECT id FROM x); DELETE FROM x", "id IN (SELECT id INTO copied FROM x)"}
+	bad := []string{
+		"",
+		"1=1; DROP TABLE Users",
+		"id IN (SELECT id FROM x); DELETE FROM x",
+		"id IN (SELECT id INTO copied FROM x)",
+		"1=1 UNION ALL SELECT * FROM dbo.Secrets",
+		"1=1 DISABLE TRIGGER ALL ON dbo.Users",
+	}
 	for _, where := range bad {
 		if _, _, _, err := mutationTarget("dbo.Users", where, nil); err == nil {
 			t.Fatalf("expected error for where %q", where)
@@ -160,8 +177,49 @@ func TestMutationTargetBindsExactParameterNames(t *testing.T) {
 	if _, _, _, err := mutationTarget("dbo.Users", "id = @missing", nil); err == nil {
 		t.Fatal("expected missing parameter error")
 	}
-	if _, _, _, err := mutationTarget("dbo.Users", "id = @__mcp_value_1", map[string]any{"__mcp_value_1": 1}); err == nil {
+	if _, _, _, err := mutationTarget("dbo.Users", "id = @mcp__value_1", map[string]any{"mcp__value_1": 1}); err == nil {
 		t.Fatal("expected reserved parameter name error")
+	}
+}
+
+func TestUpdateDataExecutesThroughDatabaseSQL(t *testing.T) {
+	conn := &transactionRecordingConn{}
+	driverName := fmt.Sprintf("update-data-%d", testDriverID.Add(1))
+	sql.Register(driverName, &transactionRecordingDriver{conn: conn})
+	database, err := sql.Open(driverName, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+
+	registry := &Registry{client: &mssqldb.Client{
+		DB:     database,
+		Config: config.Config{AccessLevel: config.DMLRW, QueryTimeout: time.Second},
+	}}
+	_, output, err := registry.updateData(context.Background(), nil, WhereMutationInput{
+		Table:   "dbo.Users",
+		Values:  map[string]any{"name": "renamed", "score": float64(7)},
+		Where:   "id = @id",
+		Params:  map[string]any{"id": float64(42)},
+		Confirm: true,
+	})
+	if err != nil {
+		t.Fatalf("updateData() error = %v", err)
+	}
+	if !output.Executed || output.RowsAffected != 1 {
+		t.Fatalf("output = %#v", output)
+	}
+	wantQuery := "UPDATE [dbo].[Users] SET [name] = @mcp__value_1, [score] = @mcp__value_2 WHERE (\nid = @id\n)"
+	if conn.lastQuery != wantQuery {
+		t.Fatalf("query = %q, want %q", conn.lastQuery, wantQuery)
+	}
+	wantArgs := []driver.NamedValue{
+		{Name: "mcp__value_1", Ordinal: 1, Value: "renamed"},
+		{Name: "mcp__value_2", Ordinal: 2, Value: int64(7)},
+		{Name: "id", Ordinal: 3, Value: int64(42)},
+	}
+	if !reflect.DeepEqual(conn.lastArgs, wantArgs) {
+		t.Fatalf("args = %#v, want %#v", conn.lastArgs, wantArgs)
 	}
 }
 
@@ -211,14 +269,34 @@ func TestIdentityTypeAllowed(t *testing.T) {
 
 func TestInsertDataUsesAtomicTransaction(t *testing.T) {
 	tests := []struct {
-		name         string
-		failAt       int
-		wantErr      bool
-		wantCommit   bool
-		wantRollback bool
+		name           string
+		rows           []map[string]any
+		failAt         int
+		wantExecutions int
+		wantErr        bool
+		wantCommit     bool
+		wantRollback   bool
 	}{
-		{name: "commit", wantCommit: true},
-		{name: "rollback", failAt: 2, wantErr: true, wantRollback: true},
+		{
+			name: "batches matching columns",
+			rows: []map[string]any{
+				{"id": float64(1), "name": "first"},
+				{"id": float64(2), "name": "second"},
+			},
+			wantExecutions: 1,
+			wantCommit:     true,
+		},
+		{
+			name: "rollback across batches",
+			rows: []map[string]any{
+				{"id": 1, "name": "first"},
+				{"id": 2},
+			},
+			failAt:         2,
+			wantExecutions: 2,
+			wantErr:        true,
+			wantRollback:   true,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -240,13 +318,13 @@ func TestInsertDataUsesAtomicTransaction(t *testing.T) {
 			}}
 			_, output, err := registry.insertData(context.Background(), nil, InsertInput{
 				Table: "dbo.Items",
-				Rows: []map[string]any{
-					{"id": 1, "name": "first"},
-					{"id": 2, "name": "second"},
-				},
+				Rows:  tt.rows,
 			})
 			if (err != nil) != tt.wantErr {
 				t.Fatalf("error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if conn.executions != tt.wantExecutions {
+				t.Fatalf("executions = %d, want %d", conn.executions, tt.wantExecutions)
 			}
 			if output.Executed != tt.wantCommit {
 				t.Fatalf("executed = %v", output.Executed)
@@ -273,6 +351,8 @@ type transactionRecordingConn struct {
 	failAt     int
 	committed  bool
 	rolledBack bool
+	lastQuery  string
+	lastArgs   []driver.NamedValue
 }
 
 func (*transactionRecordingConn) Prepare(string) (driver.Stmt, error) {
@@ -285,8 +365,10 @@ func (c *transactionRecordingConn) Begin() (driver.Tx, error) {
 	return &transactionRecordingTx{conn: c}, nil
 }
 
-func (c *transactionRecordingConn) ExecContext(context.Context, string, []driver.NamedValue) (driver.Result, error) {
+func (c *transactionRecordingConn) ExecContext(_ context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
 	c.executions++
+	c.lastQuery = query
+	c.lastArgs = args
 	if c.executions == c.failAt {
 		return nil, errors.New("injected insert failure")
 	}

@@ -96,7 +96,7 @@ func ensureEnv() error {
 	defaultEnv("MSSQL_TRUST_SERVER_CERTIFICATE", "true")
 	defaultEnv("MSSQL_ACCESS_LEVEL", "READONLY")
 	defaultEnv("MSSQL_TRANSPORT", "stdio")
-	defaultEnv("MSSQL_HTTP_ADDR", ":8080")
+	defaultEnv("MSSQL_HTTP_ADDR", "127.0.0.1:8080")
 	defaultEnv("MSSQL_HTTP_PATH", "/mcp")
 	defaultEnv("OPENAI_MODEL", "gpt-4o-mini")
 	return nil
@@ -130,7 +130,7 @@ func connectStdioMCP(ctx context.Context) (*client.Client, error) {
 		transport.WithCommandFunc(func(ctx context.Context, _ string, env []string, _ []string) (*exec.Cmd, error) {
 			cmd := exec.CommandContext(ctx, "go", "run", "./cmd/mssql-mcp")
 			cmd.Dir = serverDir()
-			cmd.Env = append(os.Environ(), env...)
+			cmd.Env = env
 			return cmd, nil
 		}),
 	)
@@ -164,7 +164,13 @@ func connectStdioMCP(ctx context.Context) (*client.Client, error) {
 
 func connectHTTPMCP(ctx context.Context) (*client.Client, error) {
 	endpoint := httpEndpoint()
-	c, err := client.NewStreamableHttpClient(endpoint)
+	var opts []transport.StreamableHTTPCOption
+	if token := strings.TrimSpace(os.Getenv("MSSQL_HTTP_BEARER_TOKEN")); token != "" {
+		opts = append(opts, transport.WithHTTPHeaders(map[string]string{
+			"Authorization": "Bearer " + token,
+		}))
+	}
+	c, err := client.NewStreamableHttpClient(endpoint, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -195,7 +201,7 @@ func httpEndpoint() string {
 
 	addr := strings.TrimSpace(os.Getenv("MSSQL_HTTP_ADDR"))
 	if addr == "" {
-		addr = ":8080"
+		addr = "127.0.0.1:8080"
 	}
 	path := strings.TrimSpace(os.Getenv("MSSQL_HTTP_PATH"))
 	if path == "" {

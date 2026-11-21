@@ -38,6 +38,7 @@ type Config struct {
 	Transport              Transport
 	HTTPAddr               string
 	HTTPPath               string
+	HTTPBearerToken        string
 }
 
 func ParseAccessLevel(s string) (AccessLevel, error) {
@@ -85,7 +86,12 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-	port, err := intEnv("MSSQL_PORT", 1433)
+	server := strings.TrimSpace(os.Getenv("MSSQL_SERVER"))
+	defaultPort := 1433
+	if strings.Contains(server, `\`) && strings.TrimSpace(os.Getenv("MSSQL_PORT")) == "" {
+		defaultPort = 0
+	}
+	port, err := intEnv("MSSQL_PORT", defaultPort)
 	if err != nil {
 		return Config{}, err
 	}
@@ -111,7 +117,7 @@ func Load() (Config, error) {
 	}
 	cfg := Config{
 		AccessLevel:            level,
-		Server:                 strings.TrimSpace(os.Getenv("MSSQL_SERVER")),
+		Server:                 server,
 		Database:               strings.TrimSpace(os.Getenv("MSSQL_DATABASE")),
 		Username:               strings.TrimSpace(os.Getenv("MSSQL_USERNAME")),
 		Password:               os.Getenv("MSSQL_PASSWORD"),
@@ -123,8 +129,9 @@ func Load() (Config, error) {
 		MaxRowsDefault:         maxRowsDefault,
 		RequireConfirmation:    requireConfirmation,
 		Transport:              transport,
-		HTTPAddr:               stringEnv("MSSQL_HTTP_ADDR", ":8080"),
+		HTTPAddr:               stringEnv("MSSQL_HTTP_ADDR", "127.0.0.1:8080"),
 		HTTPPath:               stringEnv("MSSQL_HTTP_PATH", "/mcp"),
+		HTTPBearerToken:        strings.TrimSpace(os.Getenv("MSSQL_HTTP_BEARER_TOKEN")),
 	}
 	return cfg, cfg.Validate()
 }
@@ -133,8 +140,9 @@ func (c Config) Validate() error {
 	if c.AccessLevel != ReadOnly && c.AccessLevel != DMLRW && c.AccessLevel != DDLRW {
 		return fmt.Errorf("MSSQL_ACCESS_LEVEL must be READONLY, DML-RW, or DDL-RW")
 	}
-	if strings.TrimSpace(c.Server) == "" {
-		return fmt.Errorf("MSSQL_SERVER is required")
+	_, instance, err := splitServerInstance(c.Server)
+	if err != nil {
+		return err
 	}
 	if strings.TrimSpace(c.Database) == "" {
 		return fmt.Errorf("MSSQL_DATABASE is required")
@@ -145,7 +153,7 @@ func (c Config) Validate() error {
 	if c.Password == "" {
 		return fmt.Errorf("MSSQL_PASSWORD is required")
 	}
-	if c.Port <= 0 || c.Port > 65535 {
+	if (instance == "" || c.Port != 0) && (c.Port <= 0 || c.Port > 65535) {
 		return fmt.Errorf("MSSQL_PORT must be between 1 and 65535")
 	}
 	if c.ConnectionTimeout <= 0 {
@@ -177,10 +185,26 @@ func (c Config) Validate() error {
 }
 
 func (c Config) ConnectionString() string {
+	host, instance, err := splitServerInstance(c.Server)
+	if err != nil {
+		host = strings.TrimSpace(c.Server)
+	}
+	var hostPort string
+	switch {
+	case c.Port > 0:
+		hostPort = net.JoinHostPort(host, strconv.Itoa(c.Port))
+	case strings.Contains(host, ":"):
+		hostPort = "[" + host + "]"
+	default:
+		hostPort = host
+	}
 	u := &url.URL{
 		Scheme: "sqlserver",
 		User:   url.UserPassword(c.Username, c.Password),
-		Host:   net.JoinHostPort(c.Server, strconv.Itoa(c.Port)),
+		Host:   hostPort,
+	}
+	if instance != "" {
+		u.Path = "/" + instance
 	}
 	q := u.Query()
 	q.Set("database", c.Database)
@@ -189,6 +213,43 @@ func (c Config) ConnectionString() string {
 	q.Set("TrustServerCertificate", strconv.FormatBool(c.TrustServerCertificate))
 	u.RawQuery = q.Encode()
 	return u.String()
+}
+
+func splitServerInstance(raw string) (host, instance string, err error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return "", "", fmt.Errorf("MSSQL_SERVER is required")
+	}
+	host = trimmed
+	if before, after, hasInstance := strings.Cut(trimmed, `\`); hasInstance {
+		host = strings.TrimSpace(before)
+		instance = strings.TrimSpace(after)
+		if host == "" || instance == "" || strings.Contains(instance, `\`) {
+			return "", "", fmt.Errorf("invalid MSSQL_SERVER %q", raw)
+		}
+	}
+	if strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]") {
+		host = host[1 : len(host)-1]
+		if host == "" {
+			return "", "", fmt.Errorf("invalid MSSQL_SERVER %q", raw)
+		}
+	}
+	return host, instance, nil
+}
+
+// HTTPListensBeyondLoopback reports whether the HTTP transport accepts
+// connections from other hosts. Hostnames other than localhost count as
+// non-loopback because they may resolve to a routable address.
+func (c Config) HTTPListensBeyondLoopback() bool {
+	host, _, err := net.SplitHostPort(strings.TrimSpace(c.HTTPAddr))
+	if err != nil {
+		return true
+	}
+	if strings.EqualFold(host, "localhost") {
+		return false
+	}
+	ip := net.ParseIP(host)
+	return ip == nil || !ip.IsLoopback()
 }
 
 func (c Config) PublicSummary() map[string]any {
@@ -208,6 +269,7 @@ func (c Config) PublicSummary() map[string]any {
 		"transport":              c.Transport,
 		"httpAddr":               c.HTTPAddr,
 		"httpPath":               c.HTTPPath,
+		"httpAuthConfigured":     c.HTTPBearerToken != "",
 	}
 }
 

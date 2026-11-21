@@ -3,14 +3,19 @@ package db
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"mssql-mcp/internal/config"
 	"mssql-mcp/internal/sqlsafe"
 
-	_ "github.com/microsoft/go-mssqldb"
+	mssql "github.com/microsoft/go-mssqldb"
 )
 
 type Client struct {
@@ -24,6 +29,7 @@ func Open(cfg config.Config) (*Client, error) {
 		return nil, err
 	}
 	db.SetConnMaxLifetime(30 * time.Minute)
+	db.SetConnMaxIdleTime(5 * time.Minute)
 	db.SetMaxIdleConns(2)
 	db.SetMaxOpenConns(10)
 	return &Client{DB: db, Config: cfg}, nil
@@ -78,14 +84,16 @@ func (c *Client) QueryReadOnly(ctx context.Context, query string, maxRows int, a
 }
 
 // WithSessionSetting applies a connection-scoped setting for one operation and
-// reliably restores it before the connection is returned to the pool.
+// reliably restores it before the connection is returned to the pool. If the
+// restore statement fails, the underlying connection is evicted from the pool.
 func (c *Client) WithSessionSetting(ctx context.Context, enable, disable string, fn func(*sql.Conn) error) (err error) {
 	conn, err := c.DB.Conn(ctx)
 	if err != nil {
 		return err
 	}
+	evicted := false
 	defer func() {
-		if closeErr := conn.Close(); closeErr != nil {
+		if closeErr := conn.Close(); closeErr != nil && (!evicted || !errors.Is(closeErr, sql.ErrConnDone)) {
 			err = errors.Join(err, fmt.Errorf("close database connection: %w", closeErr))
 		}
 	}()
@@ -100,6 +108,8 @@ func (c *Client) WithSessionSetting(ctx context.Context, enable, disable string,
 		resetCtx, cancel := context.WithTimeout(context.Background(), resetTimeout)
 		defer cancel()
 		if _, resetErr := conn.ExecContext(resetCtx, disable); resetErr != nil {
+			evicted = true
+			_ = conn.Raw(func(any) error { return driver.ErrBadConn })
 			err = errors.Join(err, fmt.Errorf("restore database session setting: %w", resetErr))
 		}
 	}()
@@ -123,20 +133,27 @@ func ScanRows(rows *sql.Rows) ([]map[string]any, error) {
 	if err != nil {
 		return nil, err
 	}
+	dbTypes := make([]string, len(cols))
+	if colTypes, typeErr := rows.ColumnTypes(); typeErr == nil {
+		for i := 0; i < min(len(cols), len(colTypes)); i++ {
+			dbTypes[i] = strings.ToUpper(colTypes[i].DatabaseTypeName())
+		}
+	}
 	cols = uniqueColumnNames(cols)
 	out := []map[string]any{}
+	raw := make([]any, len(cols))
+	ptrs := make([]any, len(cols))
+	for i := range raw {
+		ptrs[i] = &raw[i]
+	}
 	for rows.Next() {
-		raw := make([]any, len(cols))
-		ptrs := make([]any, len(cols))
-		for i := range raw {
-			ptrs[i] = &raw[i]
-		}
+		clear(raw)
 		if err := rows.Scan(ptrs...); err != nil {
 			return nil, err
 		}
 		row := make(map[string]any, len(cols))
 		for i, col := range cols {
-			row[col] = normalize(raw[i])
+			row[col] = normalizeColumn(raw[i], dbTypes[i])
 		}
 		out = append(out, row)
 	}
@@ -174,15 +191,75 @@ func uniqueColumnNames(columns []string) []string {
 	return result
 }
 
-func normalize(v any) any {
+func normalizeColumn(v any, dbType string) any {
 	switch x := v.(type) {
 	case nil:
 		return nil
 	case []byte:
-		return string(x)
+		switch dbType {
+		case "UNIQUEIDENTIFIER":
+			var uid mssql.UniqueIdentifier
+			if err := uid.Scan(x); err == nil {
+				return uid.String()
+			}
+			return "0x" + hex.EncodeToString(x)
+		case "DECIMAL", "NUMERIC", "MONEY", "SMALLMONEY":
+			return string(x)
+		case "BINARY", "VARBINARY", "IMAGE", "TIMESTAMP", "ROWVERSION", "GEOGRAPHY", "GEOMETRY", "HIERARCHYID":
+			return "0x" + hex.EncodeToString(x)
+		case "SQL_VARIANT":
+			if isDecimalASCII(x) {
+				return string(x)
+			}
+			return "0x" + hex.EncodeToString(x)
+		default:
+			if isSafeUTF8Text(x) {
+				return string(x)
+			}
+			return "0x" + hex.EncodeToString(x)
+		}
 	case time.Time:
 		return x.Format(time.RFC3339Nano)
 	default:
 		return x
 	}
+}
+
+func isDecimalASCII(b []byte) bool {
+	if len(b) == 0 {
+		return false
+	}
+	i := 0
+	if b[0] == '-' || b[0] == '+' {
+		i++
+		if i == len(b) {
+			return false
+		}
+	}
+	seenDot := false
+	for ; i < len(b); i++ {
+		if b[i] == '.' {
+			if seenDot {
+				return false
+			}
+			seenDot = true
+			continue
+		}
+		if b[i] < '0' || b[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func isSafeUTF8Text(b []byte) bool {
+	if !utf8.Valid(b) {
+		return false
+	}
+	for _, r := range string(b) {
+		if unicode.IsControl(r) && r != '\n' && r != '\r' && r != '\t' {
+			return false
+		}
+	}
+	return true
 }

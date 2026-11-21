@@ -9,7 +9,9 @@ import (
 	"log"
 	"net/url"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	_ "github.com/microsoft/go-mssqldb"
@@ -28,7 +30,9 @@ func main() {
 }
 
 func run() int {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	sigCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	setupCtx, cancel := context.WithTimeout(sigCtx, 10*time.Minute)
 	defer cancel()
 
 	image := strings.TrimSpace(os.Getenv("MSSQL_DEMO_IMAGE"))
@@ -36,7 +40,7 @@ func run() int {
 		image = defaultImage
 	}
 
-	container, err := mssql.Run(ctx,
+	container, err := mssql.Run(setupCtx,
 		image,
 		mssql.WithAcceptEULA(),
 		mssql.WithPassword(password),
@@ -51,7 +55,7 @@ func run() int {
 		}
 	}()
 
-	adminConn, err := container.ConnectionString(ctx, "encrypt=true", "TrustServerCertificate=true")
+	adminConn, err := container.ConnectionString(setupCtx, "encrypt=true", "TrustServerCertificate=true")
 	if err != nil {
 		log.Printf("build connection string: %v", err)
 		return 1
@@ -68,12 +72,12 @@ func run() int {
 		}
 	}()
 
-	if err := ensureDatabase(ctx, adminDB); err != nil {
+	if err := ensureDatabase(setupCtx, adminDB); err != nil {
 		log.Printf("ensure database: %v", err)
 		return 1
 	}
 
-	conn, err := container.ConnectionString(ctx, "encrypt=true", "TrustServerCertificate=true", "database="+databaseName)
+	conn, err := container.ConnectionString(setupCtx, "encrypt=true", "TrustServerCertificate=true", "database="+databaseName)
 	if err != nil {
 		log.Printf("build database connection string: %v", err)
 		return 1
@@ -90,11 +94,11 @@ func run() int {
 		}
 	}()
 
-	if err := execBatches(ctx, db, seedSQL); err != nil {
+	if err := execBatches(setupCtx, db, seedSQL); err != nil {
 		log.Printf("seed database: %v", err)
 		return 1
 	}
-	if err := verifySeeded(ctx, db); err != nil {
+	if err := verifySeeded(setupCtx, db); err != nil {
 		log.Printf("verify seeded database: %v", err)
 		return 1
 	}
@@ -115,8 +119,17 @@ func run() int {
 	printInstructions(host, port)
 
 	fmt.Println()
-	fmt.Println("SQL Server is ready. Press Enter to stop the demo and remove the container.")
-	_, _ = bufio.NewReader(os.Stdin).ReadString('\n')
+	fmt.Println("SQL Server is ready. Press Enter or Ctrl+C to stop the demo and remove the container.")
+	enterCh := make(chan struct{}, 1)
+	go func() {
+		_, _ = bufio.NewReader(os.Stdin).ReadString('\n')
+		enterCh <- struct{}{}
+	}()
+	select {
+	case <-enterCh:
+	case <-sigCtx.Done():
+		fmt.Println()
+	}
 	return 0
 }
 
@@ -180,9 +193,9 @@ func writeDemoEnv(host, port string) error {
 	defaults := map[string]string{
 		"MSSQL_MCP_SERVER_DIR": "../..",
 		"MSSQL_TRANSPORT":      "stdio",
-		"MSSQL_HTTP_ADDR":      ":8080",
+		"MSSQL_HTTP_ADDR":      "127.0.0.1:8080",
 		"MSSQL_HTTP_PATH":      "/mcp",
-		"MSSQL_HTTP_URL":       "http://localhost:8080/mcp",
+		"MSSQL_HTTP_URL":       "http://127.0.0.1:8080/mcp",
 	}
 	order := []string{
 		"MSSQL_SERVER",
@@ -298,8 +311,8 @@ func printInstructions(host, port string) {
 	fmt.Println()
 	fmt.Println("Streamable HTTP option:")
 	fmt.Println("Run the MCP server separately with:")
-	fmt.Println(`MSSQL_TRANSPORT=http MSSQL_HTTP_ADDR=:8080 MSSQL_HTTP_PATH=/mcp go run ./cmd/mssql-mcp`)
-	fmt.Println("Then point a Streamable HTTP MCP client at http://localhost:8080/mcp.")
+	fmt.Println(`MSSQL_TRANSPORT=http MSSQL_HTTP_ADDR=127.0.0.1:8080 MSSQL_HTTP_PATH=/mcp go run ./cmd/mssql-mcp`)
+	fmt.Println("Then point a Streamable HTTP MCP client at http://127.0.0.1:8080/mcp.")
 	fmt.Println()
 	fmt.Println("Agent prompt:")
 	fmt.Println(`You are an operations detective for Northwind Relay. Use the mssql-northwind-relay MCP server to inspect the schema and data. Build a concise findings report that identifies the most important operational, financial, and data-quality risks. Include the SQL evidence behind each finding and recommend the next three actions.`)

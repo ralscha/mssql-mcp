@@ -41,35 +41,70 @@ func ToolNamesForLevel(level config.AccessLevel) []string {
 	return Register(server, client)
 }
 
-func (r *Registry) tool(name string) *mcp.Tool {
-	r.names = append(r.names, name)
-	return &mcp.Tool{Name: name, Description: toolDescriptions[name]}
+type toolMeta struct {
+	description string
+	annotations *mcp.ToolAnnotations
 }
 
-var toolDescriptions = map[string]string{
-	"search_schema":               "Find tables and columns by name.",
-	"describe_table":              "Show columns, keys, and indexes.",
-	"list_table":                  "List database tables.",
-	"list_databases":              "List SQL Server databases.",
-	"list_environments":           "Show active connection settings.",
-	"profile_table":               "Summarize table rows and columns.",
-	"inspect_relationships":       "Show foreign-key relationships.",
-	"inspect_dependencies":        "Find objects depending on a table.",
-	"explain_query":               "Return the execution plan for SELECT.",
-	"read_data":                   "Run a read-only SELECT query.",
-	"test_connection":             "Verify SQL Server connectivity.",
-	"validate_environment_config": "Validate connection configuration.",
-	"list_schemas":                "List database schemas.",
-	"list_views":                  "List database views.",
-	"list_triggers":               "List database triggers.",
-	"show_create_table":           "Generate CREATE TABLE DDL.",
-	"table_size":                  "Show table size estimates.",
-	"insert_data":                 "Insert rows into a table.",
-	"update_data":                 "Update rows matching a filter.",
-	"delete_data":                 "Delete rows matching a filter.",
-	"create_table":                "Create a database table.",
-	"create_index":                "Create an index on a table.",
-	"drop_table":                  "Drop a database table.",
+func readOnlyAnnotations() *mcp.ToolAnnotations {
+	return &mcp.ToolAnnotations{
+		ReadOnlyHint:   true,
+		IdempotentHint: true,
+		OpenWorldHint:  new(false),
+	}
+}
+
+func additiveAnnotations() *mcp.ToolAnnotations {
+	return &mcp.ToolAnnotations{
+		ReadOnlyHint:    false,
+		IdempotentHint:  false,
+		DestructiveHint: new(false),
+		OpenWorldHint:   new(false),
+	}
+}
+
+func destructiveAnnotations(idempotent bool) *mcp.ToolAnnotations {
+	return &mcp.ToolAnnotations{
+		ReadOnlyHint:    false,
+		IdempotentHint:  idempotent,
+		DestructiveHint: new(true),
+		OpenWorldHint:   new(false),
+	}
+}
+
+func (r *Registry) tool(name string) *mcp.Tool {
+	r.names = append(r.names, name)
+	meta := toolCatalog[name]
+	return &mcp.Tool{
+		Name:        name,
+		Description: meta.description,
+		Annotations: meta.annotations,
+	}
+}
+
+var toolCatalog = map[string]toolMeta{
+	"search_schema":         {"Find tables and columns by name.", readOnlyAnnotations()},
+	"describe_table":        {"Show columns, keys, and indexes.", readOnlyAnnotations()},
+	"list_table":            {"List database tables.", readOnlyAnnotations()},
+	"list_databases":        {"List SQL Server databases.", readOnlyAnnotations()},
+	"list_environments":     {"Show active connection settings.", readOnlyAnnotations()},
+	"profile_table":         {"Summarize table rows and columns.", readOnlyAnnotations()},
+	"inspect_relationships": {"Show foreign-key relationships.", readOnlyAnnotations()},
+	"inspect_dependencies":  {"Find objects depending on a table.", readOnlyAnnotations()},
+	"explain_query":         {"Return the execution plan for SELECT.", readOnlyAnnotations()},
+	"read_data":             {"Run a read-only SELECT query.", readOnlyAnnotations()},
+	"test_connection":       {"Verify SQL Server connectivity.", readOnlyAnnotations()},
+	"list_schemas":          {"List database schemas.", readOnlyAnnotations()},
+	"list_views":            {"List database views.", readOnlyAnnotations()},
+	"list_triggers":         {"List database triggers.", readOnlyAnnotations()},
+	"show_create_table":     {"Generate CREATE TABLE DDL.", readOnlyAnnotations()},
+	"table_size":            {"Show table size estimates.", readOnlyAnnotations()},
+	"insert_data":           {"Insert rows into a table.", additiveAnnotations()},
+	"update_data":           {"Update rows matching a filter.", destructiveAnnotations(false)},
+	"delete_data":           {"Delete rows matching a filter.", destructiveAnnotations(true)},
+	"create_table":          {"Create a database table.", additiveAnnotations()},
+	"create_index":          {"Create an index on a table.", additiveAnnotations()},
+	"drop_table":            {"Drop a database table.", destructiveAnnotations(true)},
 }
 
 func (r *Registry) addReadOnly(server *mcp.Server) {
@@ -84,7 +119,6 @@ func (r *Registry) addReadOnly(server *mcp.Server) {
 	mcp.AddTool(server, r.tool("explain_query"), r.explainQuery)
 	mcp.AddTool(server, r.tool("read_data"), r.readData)
 	mcp.AddTool(server, r.tool("test_connection"), r.testConnection)
-	mcp.AddTool(server, r.tool("validate_environment_config"), r.validateEnvironmentConfig)
 	mcp.AddTool(server, r.tool("list_schemas"), r.listSchemas)
 	mcp.AddTool(server, r.tool("list_views"), r.listViews)
 	mcp.AddTool(server, r.tool("list_triggers"), r.listTriggers)
@@ -103,6 +137,8 @@ func (r *Registry) addDDL(server *mcp.Server) {
 	mcp.AddTool(server, r.tool("create_index"), r.createIndex)
 	mcp.AddTool(server, r.tool("drop_table"), r.dropTable)
 }
+
+type EmptyInput struct{}
 
 type RowsOutput struct {
 	Rows []map[string]any `json:"rows"`
@@ -126,25 +162,29 @@ func (r *Registry) searchSchema(ctx context.Context, _ *mcp.CallToolRequest, in 
 	limit := bounded(in.Limit, 50, 200)
 	pattern := sqlsafe.LikePattern(in.Query)
 	tables, err := r.client.Query(ctx, `
-SELECT TABLE_SCHEMA AS [schema], TABLE_NAME AS [table], TABLE_TYPE AS [type]
-FROM INFORMATION_SCHEMA.TABLES
-WHERE TABLE_TYPE = 'BASE TABLE' AND (TABLE_SCHEMA LIKE @p1 ESCAPE '\' OR TABLE_NAME LIKE @p1 ESCAPE '\')
-ORDER BY TABLE_SCHEMA, TABLE_NAME
+SELECT s.name AS [schema], tb.name AS [table], 'BASE TABLE' AS [type]
+FROM sys.tables tb
+JOIN sys.schemas s ON tb.schema_id = s.schema_id
+WHERE s.name LIKE @p1 ESCAPE '\' OR tb.name LIKE @p1 ESCAPE '\'
+ORDER BY s.name, tb.name
 OFFSET @p2 ROWS FETCH NEXT @p3 ROWS ONLY`, pattern, max(in.TableOffset, 0), limit)
 	if err != nil {
 		return nil, SearchSchemaOutput{}, err
 	}
 	columns, err := r.client.Query(ctx, `
-SELECT TABLE_SCHEMA AS [schema], TABLE_NAME AS [table], COLUMN_NAME AS [column], DATA_TYPE AS [dataType]
-FROM INFORMATION_SCHEMA.COLUMNS
-WHERE TABLE_SCHEMA LIKE @p1 ESCAPE '\' OR TABLE_NAME LIKE @p1 ESCAPE '\' OR COLUMN_NAME LIKE @p1 ESCAPE '\'
-ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION
+SELECT s.name AS [schema], tb.name AS [table], c.name AS [column], t.name AS [dataType]
+FROM sys.columns c
+JOIN sys.tables tb ON c.object_id = tb.object_id
+JOIN sys.schemas s ON tb.schema_id = s.schema_id
+JOIN sys.types t ON c.user_type_id = t.user_type_id
+WHERE s.name LIKE @p1 ESCAPE '\' OR tb.name LIKE @p1 ESCAPE '\' OR c.name LIKE @p1 ESCAPE '\'
+ORDER BY s.name, tb.name, c.column_id
 OFFSET @p2 ROWS FETCH NEXT @p3 ROWS ONLY`, pattern, max(in.ColumnOffset, 0), limit)
 	return nil, SearchSchemaOutput{Tables: tables, Columns: columns}, err
 }
 
 type TableInput struct {
-	Table string `json:"table"`
+	Table string `json:"table" jsonschema:"Table name as table or schema.table."`
 }
 
 type DescribeTableOutput struct {
@@ -162,14 +202,25 @@ func (r *Registry) describeTable(ctx context.Context, _ *mcp.CallToolRequest, in
 		return nil, DescribeTableOutput{}, err
 	}
 	columns, err := r.client.Query(ctx, `
-SELECT c.name AS [name], t.name AS [dataType], c.max_length AS [maxLength], c.precision, c.scale,
-       c.is_nullable AS [nullable], c.is_identity AS [identity], dc.definition AS [default]
+SELECT c.name AS [name],
+       t.name AS [dataType],
+       CASE
+         WHEN c.max_length = -1 THEN -1
+         WHEN st.name IN ('nvarchar', 'nchar') THEN c.max_length / 2
+         ELSE c.max_length
+       END AS [maxLength],
+       c.precision,
+       c.scale,
+       c.is_nullable AS [nullable],
+       c.is_identity AS [identity],
+       dc.definition AS [default]
 FROM sys.columns c
 JOIN sys.types t ON c.user_type_id = t.user_type_id
+LEFT JOIN sys.types st ON c.system_type_id = st.user_type_id
 JOIN sys.tables tb ON c.object_id = tb.object_id
 JOIN sys.schemas s ON tb.schema_id = s.schema_id
 LEFT JOIN sys.default_constraints dc ON c.default_object_id = dc.object_id
-WHERE s.name = @p1 AND tb.name = @p2
+WHERE s.name = COALESCE(NULLIF(@p1, ''), SCHEMA_NAME(), 'dbo') AND tb.name = @p2
 ORDER BY c.column_id`, schema, table)
 	if err != nil {
 		return nil, DescribeTableOutput{}, err
@@ -184,7 +235,11 @@ JOIN sys.index_columns ic ON i.object_id = ic.object_id AND i.index_id = ic.inde
 JOIN sys.columns c ON ic.object_id = c.object_id AND ic.column_id = c.column_id
 JOIN sys.tables t ON i.object_id = t.object_id
 JOIN sys.schemas s ON t.schema_id = s.schema_id
-WHERE i.is_primary_key = 1 AND s.name = @p1 AND t.name = @p2
+WHERE i.is_primary_key = 1
+  AND ic.key_ordinal > 0
+  AND ic.is_included_column = 0
+  AND s.name = COALESCE(NULLIF(@p1, ''), SCHEMA_NAME(), 'dbo')
+  AND t.name = @p2
 ORDER BY ic.key_ordinal`, schema, table)
 	if err != nil {
 		return nil, DescribeTableOutput{}, err
@@ -194,20 +249,28 @@ ORDER BY ic.key_ordinal`, schema, table)
 		return nil, DescribeTableOutput{}, err
 	}
 	indexes, err := r.client.Query(ctx, `
-SELECT i.name AS [name], i.type_desc AS [type], i.is_unique AS [unique], c.name AS [column], ic.key_ordinal AS [ordinal]
+SELECT i.name AS [name],
+       i.type_desc AS [type],
+       i.is_unique AS [unique],
+       c.name AS [column],
+       ic.key_ordinal AS [ordinal],
+       ic.is_included_column AS [included],
+       ic.is_descending_key AS [descending]
 FROM sys.indexes i
 JOIN sys.index_columns ic ON i.object_id = ic.object_id AND i.index_id = ic.index_id
 JOIN sys.columns c ON ic.object_id = c.object_id AND ic.column_id = c.column_id
 JOIN sys.tables t ON i.object_id = t.object_id
 JOIN sys.schemas s ON t.schema_id = s.schema_id
-WHERE s.name = @p1 AND t.name = @p2 AND i.name IS NOT NULL
-ORDER BY i.name, ic.key_ordinal`, schema, table)
+WHERE s.name = COALESCE(NULLIF(@p1, ''), SCHEMA_NAME(), 'dbo')
+  AND t.name = @p2
+  AND i.name IS NOT NULL
+ORDER BY i.name, ic.is_included_column, ic.key_ordinal, ic.index_column_id`, schema, table)
 	return nil, DescribeTableOutput{Columns: columns, PrimaryKeys: pks, ForeignKeys: fks, Indexes: indexes}, err
 }
 
 type ListTableInput struct {
-	Schema string `json:"schema,omitempty"`
-	Filter string `json:"filter,omitempty" jsonschema:"Table-name pattern; * is supported as a wildcard."`
+	Schema string `json:"schema,omitempty" jsonschema:"Exact schema name filter."`
+	Filter string `json:"filter,omitempty" jsonschema:"Name pattern; * is supported as a wildcard."`
 	Limit  int    `json:"limit,omitempty" jsonschema:"Maximum results; defaults to 200 and is capped at 1000."`
 }
 
@@ -216,17 +279,17 @@ func (r *Registry) listTable(ctx context.Context, _ *mcp.CallToolRequest, in Lis
 	defer cancel()
 	limit := bounded(in.Limit, 200, 1000)
 	rows, err := r.client.Query(ctx, `
-SELECT TABLE_SCHEMA AS [schema], TABLE_NAME AS [table]
-FROM INFORMATION_SCHEMA.TABLES
-WHERE TABLE_TYPE = 'BASE TABLE'
-  AND (@p1 = '' OR TABLE_SCHEMA = @p1)
-  AND (@p2 = '' OR TABLE_NAME LIKE @p2 ESCAPE '\')
-ORDER BY TABLE_SCHEMA, TABLE_NAME
+SELECT s.name AS [schema], tb.name AS [table]
+FROM sys.tables tb
+JOIN sys.schemas s ON tb.schema_id = s.schema_id
+WHERE (@p1 = '' OR s.name = @p1)
+  AND (@p2 = '' OR tb.name LIKE @p2 ESCAPE '\')
+ORDER BY s.name, tb.name
 OFFSET 0 ROWS FETCH NEXT @p3 ROWS ONLY`, in.Schema, patternOrEmpty(in.Filter), limit)
 	return nil, RowsOutput{Rows: rows}, err
 }
 
-func (r *Registry) listDatabases(ctx context.Context, _ *mcp.CallToolRequest, _ any) (*mcp.CallToolResult, RowsOutput, error) {
+func (r *Registry) listDatabases(ctx context.Context, _ *mcp.CallToolRequest, _ EmptyInput) (*mcp.CallToolResult, RowsOutput, error) {
 	ctx, cancel := r.client.TimeoutContext(ctx)
 	defer cancel()
 	rows, err := r.client.Query(ctx, `SELECT name, state_desc AS [state], user_access_desc AS [userAccess] FROM sys.databases ORDER BY name`)
@@ -237,14 +300,14 @@ type EnvironmentsOutput struct {
 	Environments []map[string]any `json:"environments"`
 }
 
-func (r *Registry) listEnvironments(context.Context, *mcp.CallToolRequest, any) (*mcp.CallToolResult, EnvironmentsOutput, error) {
+func (r *Registry) listEnvironments(context.Context, *mcp.CallToolRequest, EmptyInput) (*mcp.CallToolResult, EnvironmentsOutput, error) {
 	env := r.client.Config.PublicSummary()
 	env["name"] = "default"
 	return nil, EnvironmentsOutput{Environments: []map[string]any{env}}, nil
 }
 
 type ProfileTableInput struct {
-	Table          string `json:"table"`
+	Table          string `json:"table" jsonschema:"Table name as table or schema.table."`
 	IncludeSamples bool   `json:"includeSamples,omitempty"`
 	SampleSize     int    `json:"sampleSize,omitempty" jsonschema:"Sample rows to return; defaults to 10 and is capped at 100."`
 }
@@ -263,44 +326,129 @@ func (r *Registry) profileTable(ctx context.Context, _ *mcp.CallToolRequest, in 
 	if err != nil {
 		return nil, ProfileTableOutput{}, err
 	}
-	qname, err := sqlsafe.QuoteMultipart(schema + "." + table)
-	if err != nil {
-		return nil, ProfileTableOutput{}, err
-	}
-	rowCount, err := r.client.Query(ctx, "SELECT COUNT_BIG(*) AS [count] FROM "+qname)
-	if err != nil {
-		return nil, ProfileTableOutput{}, err
-	}
 	cols, err := r.client.Query(ctx, `
-SELECT c.name AS [name], t.name AS [dataType]
+SELECT s.name AS [schema], tb.name AS [table], c.name AS [name], t.name AS [dataType], COALESCE(st.name, t.name) AS [systemType]
 FROM sys.columns c
 JOIN sys.types t ON c.user_type_id = t.user_type_id
+LEFT JOIN sys.types st ON c.system_type_id = st.user_type_id
 JOIN sys.tables tb ON c.object_id = tb.object_id
 JOIN sys.schemas s ON tb.schema_id = s.schema_id
-WHERE s.name = @p1 AND tb.name = @p2
+WHERE s.name = COALESCE(NULLIF(@p1, ''), SCHEMA_NAME(), 'dbo') AND tb.name = @p2
 ORDER BY c.column_id`, schema, table)
 	if err != nil {
 		return nil, ProfileTableOutput{}, err
 	}
+	if len(cols) == 0 {
+		return nil, ProfileTableOutput{}, fmt.Errorf("table %q was not found", in.Table)
+	}
+	resolvedSchema, _ := cols[0]["schema"].(string)
+	resolvedTable, _ := cols[0]["table"].(string)
+	qname, err := quoteResolvedTable(resolvedSchema, resolvedTable)
+	if err != nil {
+		return nil, ProfileTableOutput{}, err
+	}
+
+	const profileColumnsPerScan = 25
 	summaries := make([]map[string]any, 0, len(cols))
 	warnings := make([]string, 0)
-	for _, col := range cols {
+	var rowCount []map[string]any
+
+	type profileColSpec struct {
+		index         int
+		name          string
+		dataType      any
+		qcol          string
+		canDistinct   bool
+		canMinMax     bool
+		castBitMinMax bool
+	}
+
+	specs := make([]profileColSpec, 0, len(cols))
+	for i, col := range cols {
 		name, _ := col["name"].(string)
-		qcol, err := sqlsafe.QuoteIdentifier(name)
+		sysType, _ := col["systemType"].(string)
+		qcol, err := sqlsafe.QuoteRawIdentifier(name)
 		if err != nil {
+			warnings = append(warnings, fmt.Sprintf("skipping column %q: %v", name, err))
 			continue
 		}
-		stats, err := r.client.Query(ctx, fmt.Sprintf("SELECT COUNT_BIG(*) - COUNT(%s) AS [nullCount], COUNT_BIG(DISTINCT %s) AS [distinctCount], MIN(%s) AS [min], MAX(%s) AS [max] FROM %s", qcol, qcol, qcol, qcol, qname))
-		if err != nil {
-			warnings = append(warnings, fmt.Sprintf("could not profile column %q: %v", name, err))
-			continue
+		canDistinct, canMinMax, castBit := profileCapabilities(strings.ToLower(sysType))
+		if !canDistinct || !canMinMax {
+			warnings = append(warnings, fmt.Sprintf("column %q (%v) does not support full distinct/min/max profiling; reporting null count", name, col["dataType"]))
 		}
-		if len(stats) > 0 {
-			stats[0]["name"] = name
-			stats[0]["dataType"] = col["dataType"]
-			summaries = append(summaries, stats[0])
+		specs = append(specs, profileColSpec{
+			index:         i,
+			name:          name,
+			dataType:      col["dataType"],
+			qcol:          qcol,
+			canDistinct:   canDistinct,
+			canMinMax:     canMinMax,
+			castBitMinMax: castBit,
+		})
+	}
+
+	if len(specs) == 0 {
+		rowCount, err = r.client.Query(ctx, "SELECT COUNT_BIG(*) AS [count] FROM "+qname)
+		if err != nil {
+			return nil, ProfileTableOutput{}, err
 		}
 	}
+
+	for start := 0; start < len(specs); start += profileColumnsPerScan {
+		chunk := specs[start:min(start+profileColumnsPerScan, len(specs))]
+		selectExprs := make([]string, 0, 1+len(chunk)*4)
+		if start == 0 {
+			selectExprs = append(selectExprs, "COUNT_BIG(*) AS [__row_count]")
+		}
+		for i, spec := range chunk {
+			selectExprs = append(selectExprs, fmt.Sprintf("COUNT_BIG(CASE WHEN %s IS NULL THEN 1 END) AS [__null_%d]", spec.qcol, i))
+			if spec.canDistinct {
+				selectExprs = append(selectExprs, fmt.Sprintf("COUNT_BIG(DISTINCT %s) AS [__dist_%d]", spec.qcol, i))
+			}
+			if spec.canMinMax {
+				minMaxExpr := spec.qcol
+				if spec.castBitMinMax {
+					minMaxExpr = "CAST(" + spec.qcol + " AS tinyint)"
+				}
+				selectExprs = append(selectExprs,
+					fmt.Sprintf("MIN(%s) AS [__min_%d]", minMaxExpr, i),
+					fmt.Sprintf("MAX(%s) AS [__max_%d]", minMaxExpr, i),
+				)
+			}
+		}
+		statsRows, err := r.client.Query(ctx, "SELECT "+strings.Join(selectExprs, ", ")+" FROM "+qname)
+		if err != nil {
+			return nil, ProfileTableOutput{}, err
+		}
+		if len(statsRows) == 0 {
+			continue
+		}
+		stats := statsRows[0]
+		if start == 0 {
+			rowCount = []map[string]any{{"count": stats["__row_count"]}}
+		}
+		for i, spec := range chunk {
+			summary := map[string]any{
+				"name":      spec.name,
+				"dataType":  spec.dataType,
+				"nullCount": stats[fmt.Sprintf("__null_%d", i)],
+			}
+			if spec.canDistinct {
+				summary["distinctCount"] = stats[fmt.Sprintf("__dist_%d", i)]
+			} else {
+				summary["distinctCount"] = nil
+			}
+			if spec.canMinMax {
+				summary["min"] = stats[fmt.Sprintf("__min_%d", i)]
+				summary["max"] = stats[fmt.Sprintf("__max_%d", i)]
+			} else {
+				summary["min"] = nil
+				summary["max"] = nil
+			}
+			summaries = append(summaries, summary)
+		}
+	}
+
 	var samples []map[string]any
 	if in.IncludeSamples {
 		sampleSize := bounded(in.SampleSize, 10, 100)
@@ -310,6 +458,19 @@ ORDER BY c.column_id`, schema, table)
 		}
 	}
 	return nil, ProfileTableOutput{RowCount: rowCount, Columns: summaries, Samples: samples, Warnings: warnings}, nil
+}
+
+func profileCapabilities(sysType string) (canDistinct, canMinMax, castBit bool) {
+	switch sysType {
+	case "text", "ntext", "image", "xml", "geography", "geometry", "sql_variant":
+		return false, false, false
+	case "bit":
+		return true, true, true
+	case "uniqueidentifier", "binary", "varbinary", "timestamp", "rowversion", "hierarchyid":
+		return true, false, false
+	default:
+		return true, true, false
+	}
 }
 
 type RelationshipsOutput struct {
@@ -333,12 +494,13 @@ func (r *Registry) inspectRelationships(ctx context.Context, _ *mcp.CallToolRequ
 }
 
 func (r *Registry) foreignKeys(ctx context.Context, schema, table, direction string) ([]map[string]any, error) {
-	filter := "((ps.name = @p1 AND pt.name = @p2) OR (rs.name = @p1 AND rt.name = @p2))"
+	const schemaExpr = "COALESCE(NULLIF(@p1, ''), SCHEMA_NAME(), 'dbo')"
+	filter := "((ps.name = " + schemaExpr + " AND pt.name = @p2) OR (rs.name = " + schemaExpr + " AND rt.name = @p2))"
 	switch direction {
 	case "outbound":
-		filter = "(ps.name = @p1 AND pt.name = @p2)"
+		filter = "(ps.name = " + schemaExpr + " AND pt.name = @p2)"
 	case "inbound":
-		filter = "(rs.name = @p1 AND rt.name = @p2)"
+		filter = "(rs.name = " + schemaExpr + " AND rt.name = @p2)"
 	}
 	return r.client.Query(ctx, `
 SELECT fk.name AS [foreignKey], ps.name AS [schema], pt.name AS [table], pc.name AS [column],
@@ -366,19 +528,32 @@ func (r *Registry) inspectDependencies(ctx context.Context, _ *mcp.CallToolReque
 	if err != nil {
 		return nil, DependenciesOutput{}, err
 	}
+	// Unqualified references resolve against the referencing object's schema
+	// first and then dbo, so they are compared with the target's object_id.
 	rows, err := r.client.Query(ctx, `
+WITH target AS (
+    SELECT COALESCE(NULLIF(@p1, ''), SCHEMA_NAME(), 'dbo') AS schema_name,
+           OBJECT_ID(QUOTENAME(COALESCE(NULLIF(@p1, ''), SCHEMA_NAME(), 'dbo')) + N'.' + QUOTENAME(@p2)) AS object_id
+)
 SELECT DISTINCT s.name AS [schema], o.name AS [object], o.type_desc AS [type]
 FROM sys.sql_expression_dependencies d
+CROSS JOIN target tg
 JOIN sys.objects o ON d.referencing_id = o.object_id
 JOIN sys.schemas s ON o.schema_id = s.schema_id
-WHERE d.referenced_schema_name = @p1 AND d.referenced_entity_name = @p2
+WHERE d.referenced_id = tg.object_id
+   OR (d.referenced_server_name IS NULL
+       AND d.referenced_database_name IS NULL
+       AND d.referenced_entity_name = @p2
+       AND (d.referenced_schema_name = tg.schema_name
+            OR (d.referenced_schema_name IS NULL
+                AND COALESCE(OBJECT_ID(QUOTENAME(s.name) + N'.' + QUOTENAME(@p2)), OBJECT_ID(N'[dbo].' + QUOTENAME(@p2))) = tg.object_id)))
 ORDER BY s.name, o.name`, schema, table)
 	return nil, DependenciesOutput{Dependencies: rows}, err
 }
 
 type QueryInput struct {
 	Query   string         `json:"query" jsonschema:"One T-SQL SELECT statement; named placeholders use @name syntax."`
-	Params  map[string]any `json:"params,omitempty" jsonschema:"Values for every named placeholder, keyed without @."`
+	Params  map[string]any `json:"params,omitempty" jsonschema:"Values for every named placeholder, keyed without @. Pass integers beyond +/-2^53 as strings to keep full precision."`
 	MaxRows int            `json:"maxRows,omitempty" jsonschema:"Maximum rows to return, capped by MSSQL_MAX_ROWS_DEFAULT."`
 }
 
@@ -394,11 +569,16 @@ func (r *Registry) readData(ctx context.Context, _ *mcp.CallToolRequest, in Quer
 	return nil, RowsOutput{Rows: rows}, err
 }
 
+type ExplainQueryInput struct {
+	Query  string         `json:"query" jsonschema:"One T-SQL SELECT statement; named placeholders use @name syntax."`
+	Params map[string]any `json:"params,omitempty" jsonschema:"Values for every named placeholder, keyed without @. Pass integers beyond +/-2^53 as strings to keep full precision."`
+}
+
 type ExplainOutput struct {
 	Plan []map[string]any `json:"plan"`
 }
 
-func (r *Registry) explainQuery(ctx context.Context, _ *mcp.CallToolRequest, in QueryInput) (*mcp.CallToolResult, ExplainOutput, error) {
+func (r *Registry) explainQuery(ctx context.Context, _ *mcp.CallToolRequest, in ExplainQueryInput) (*mcp.CallToolResult, ExplainOutput, error) {
 	if err := sqlsafe.ValidateReadOnlyQuery(in.Query); err != nil {
 		return nil, ExplainOutput{}, fmt.Errorf("invalid read-only query: %w", err)
 	}
@@ -430,13 +610,10 @@ type ConnectionOutput struct {
 	Rows      []map[string]any `json:"rows,omitempty"`
 }
 
-func (r *Registry) testConnection(ctx context.Context, _ *mcp.CallToolRequest, _ any) (*mcp.CallToolResult, ConnectionOutput, error) {
+func (r *Registry) testConnection(ctx context.Context, _ *mcp.CallToolRequest, _ EmptyInput) (*mcp.CallToolResult, ConnectionOutput, error) {
 	ctx, cancel := context.WithTimeout(ctx, r.client.Config.ConnectionTimeout)
 	defer cancel()
 	start := time.Now()
-	if err := r.client.DB.PingContext(ctx); err != nil {
-		return nil, ConnectionOutput{}, err
-	}
 	rows, err := r.client.Query(ctx, `SELECT DB_NAME() AS [database], @@VERSION AS [version]`)
 	if err != nil {
 		return nil, ConnectionOutput{}, err
@@ -444,17 +621,7 @@ func (r *Registry) testConnection(ctx context.Context, _ *mcp.CallToolRequest, _
 	return nil, ConnectionOutput{OK: true, LatencyMS: time.Since(start).Milliseconds(), Config: r.client.Config.PublicSummary(), Rows: rows}, nil
 }
 
-type ValidationOutput struct {
-	Valid  bool           `json:"valid"`
-	Config map[string]any `json:"config"`
-}
-
-func (r *Registry) validateEnvironmentConfig(context.Context, *mcp.CallToolRequest, any) (*mcp.CallToolResult, ValidationOutput, error) {
-	err := r.client.Config.Validate()
-	return nil, ValidationOutput{Valid: err == nil, Config: r.client.Config.PublicSummary()}, err
-}
-
-func (r *Registry) listSchemas(ctx context.Context, _ *mcp.CallToolRequest, _ any) (*mcp.CallToolResult, RowsOutput, error) {
+func (r *Registry) listSchemas(ctx context.Context, _ *mcp.CallToolRequest, _ EmptyInput) (*mcp.CallToolResult, RowsOutput, error) {
 	ctx, cancel := r.client.TimeoutContext(ctx)
 	defer cancel()
 	rows, err := r.client.Query(ctx, `
@@ -468,22 +635,33 @@ ORDER BY s.name`)
 	return nil, RowsOutput{Rows: rows}, err
 }
 
-func (r *Registry) listViews(ctx context.Context, _ *mcp.CallToolRequest, _ any) (*mcp.CallToolResult, RowsOutput, error) {
+type ListDefinitionsInput struct {
+	Schema string `json:"schema,omitempty" jsonschema:"Exact schema name filter."`
+	Filter string `json:"filter,omitempty" jsonschema:"Object-name pattern; * is supported as a wildcard."`
+	Limit  int    `json:"limit,omitempty" jsonschema:"Maximum results; defaults to 100 and is capped at 500."`
+}
+
+func (r *Registry) listViews(ctx context.Context, _ *mcp.CallToolRequest, in ListDefinitionsInput) (*mcp.CallToolResult, RowsOutput, error) {
 	ctx, cancel := r.client.TimeoutContext(ctx)
 	defer cancel()
+	limit := bounded(in.Limit, 100, 500)
 	rows, err := r.client.Query(ctx, `
 SELECT s.name AS [schema],
        v.name AS [view],
        OBJECT_DEFINITION(v.object_id) AS [definition]
 FROM sys.views v
 JOIN sys.schemas s ON v.schema_id = s.schema_id
-ORDER BY s.name, v.name`)
+WHERE (@p1 = '' OR s.name = @p1)
+  AND (@p2 = '' OR v.name LIKE @p2 ESCAPE '\')
+ORDER BY s.name, v.name
+OFFSET 0 ROWS FETCH NEXT @p3 ROWS ONLY`, in.Schema, patternOrEmpty(in.Filter), limit)
 	return nil, RowsOutput{Rows: rows}, err
 }
 
-func (r *Registry) listTriggers(ctx context.Context, _ *mcp.CallToolRequest, _ any) (*mcp.CallToolResult, RowsOutput, error) {
+func (r *Registry) listTriggers(ctx context.Context, _ *mcp.CallToolRequest, in ListDefinitionsInput) (*mcp.CallToolResult, RowsOutput, error) {
 	ctx, cancel := r.client.TimeoutContext(ctx)
 	defer cancel()
+	limit := bounded(in.Limit, 100, 500)
 	rows, err := r.client.Query(ctx, `
 SELECT ts.name AS [schema],
        tr.name AS [name],
@@ -506,7 +684,10 @@ OUTER APPLY (
     ).value('.', 'nvarchar(max)'), 1, 2, '') AS events
 ) events
 WHERE tr.parent_class_desc = 'OBJECT_OR_COLUMN'
-ORDER BY ps.name, parent.name, tr.name`)
+  AND (@p1 = '' OR ps.name = @p1 OR ts.name = @p1)
+  AND (@p2 = '' OR tr.name LIKE @p2 ESCAPE '\' OR parent.name LIKE @p2 ESCAPE '\')
+ORDER BY ps.name, parent.name, tr.name
+OFFSET 0 ROWS FETCH NEXT @p3 ROWS ONLY`, in.Schema, patternOrEmpty(in.Filter), limit)
 	return nil, RowsOutput{Rows: rows}, err
 }
 
@@ -521,17 +702,17 @@ func (r *Registry) showCreateTable(ctx context.Context, _ *mcp.CallToolRequest, 
 	if err != nil {
 		return nil, DDLOutput{}, err
 	}
-	qname, err := sqlsafe.QuoteMultipart(schema + "." + table)
-	if err != nil {
-		return nil, DDLOutput{}, err
-	}
 	cols, err := r.client.Query(ctx, `
-SELECT c.name AS [name],
+SELECT s.name AS [schema],
+       tb.name AS [table],
+       c.name AS [name],
        CASE
-         WHEN t.name IN ('varchar', 'char', 'varbinary', 'binary') THEN t.name + '(' + CASE WHEN c.max_length = -1 THEN 'MAX' ELSE CONVERT(varchar(10), c.max_length) END + ')'
-         WHEN t.name IN ('nvarchar', 'nchar') THEN t.name + '(' + CASE WHEN c.max_length = -1 THEN 'MAX' ELSE CONVERT(varchar(10), c.max_length / 2) END + ')'
-         WHEN t.name IN ('decimal', 'numeric') THEN t.name + '(' + CONVERT(varchar(10), c.precision) + ',' + CONVERT(varchar(10), c.scale) + ')'
-         WHEN t.name IN ('datetime2', 'datetimeoffset', 'time') THEN t.name + '(' + CONVERT(varchar(10), c.scale) + ')'
+         WHEN t.is_user_defined = 1 THEN QUOTENAME(ts.name) + '.' + QUOTENAME(t.name)
+         WHEN st.name IN ('varchar', 'char', 'varbinary', 'binary') THEN st.name + '(' + CASE WHEN c.max_length = -1 THEN 'MAX' ELSE CONVERT(varchar(10), c.max_length) END + ')'
+         WHEN st.name IN ('nvarchar', 'nchar') THEN st.name + '(' + CASE WHEN c.max_length = -1 THEN 'MAX' ELSE CONVERT(varchar(10), c.max_length / 2) END + ')'
+         WHEN st.name IN ('decimal', 'numeric') THEN st.name + '(' + CONVERT(varchar(10), c.precision) + ',' + CONVERT(varchar(10), c.scale) + ')'
+         WHEN st.name IN ('datetime2', 'datetimeoffset', 'time') THEN st.name + '(' + CONVERT(varchar(10), c.scale) + ')'
+         WHEN st.name = 'float' AND c.precision < 53 THEN 'float(' + CONVERT(varchar(10), c.precision) + ')'
          ELSE t.name
        END AS [type],
        c.is_nullable AS [nullable],
@@ -542,12 +723,14 @@ SELECT c.name AS [name],
        cc.is_persisted AS [computedPersisted]
 FROM sys.columns c
 JOIN sys.types t ON c.user_type_id = t.user_type_id
+JOIN sys.schemas ts ON t.schema_id = ts.schema_id
+LEFT JOIN sys.types st ON c.system_type_id = st.user_type_id
 JOIN sys.tables tb ON c.object_id = tb.object_id
 JOIN sys.schemas s ON tb.schema_id = s.schema_id
 LEFT JOIN sys.default_constraints dc ON c.default_object_id = dc.object_id
 LEFT JOIN sys.identity_columns ic ON c.object_id = ic.object_id AND c.column_id = ic.column_id
 LEFT JOIN sys.computed_columns cc ON c.object_id = cc.object_id AND c.column_id = cc.column_id
-WHERE s.name = @p1 AND tb.name = @p2
+WHERE s.name = COALESCE(NULLIF(@p1, ''), SCHEMA_NAME(), 'dbo') AND tb.name = @p2
 ORDER BY c.column_id`, schema, table)
 	if err != nil {
 		return nil, DDLOutput{}, err
@@ -555,12 +738,18 @@ ORDER BY c.column_id`, schema, table)
 	if len(cols) == 0 {
 		return nil, DDLOutput{}, fmt.Errorf("table %q was not found", in.Table)
 	}
+	resolvedSchema, _ := cols[0]["schema"].(string)
+	resolvedTable, _ := cols[0]["table"].(string)
+	qname, err := quoteResolvedTable(resolvedSchema, resolvedTable)
+	if err != nil {
+		return nil, DDLOutput{}, err
+	}
 
 	colDefs := make([]string, 0, len(cols)+1)
 	for _, col := range cols {
 		name, _ := col["name"].(string)
 		typ, _ := col["type"].(string)
-		qcol, err := sqlsafe.QuoteIdentifier(name)
+		qcol, err := sqlsafe.QuoteRawIdentifier(name)
 		if err != nil {
 			return nil, DDLOutput{}, err
 		}
@@ -568,6 +757,9 @@ ORDER BY c.column_id`, schema, table)
 			def := qcol + " AS " + computed
 			if persisted, _ := col["computedPersisted"].(bool); persisted {
 				def += " PERSISTED"
+				if nullable, _ := col["nullable"].(bool); !nullable {
+					def += " NOT NULL"
+				}
 			}
 			colDefs = append(colDefs, def)
 			continue
@@ -595,15 +787,19 @@ JOIN sys.index_columns ic ON i.object_id = ic.object_id AND i.index_id = ic.inde
 JOIN sys.columns c ON ic.object_id = c.object_id AND ic.column_id = c.column_id
 JOIN sys.tables t ON i.object_id = t.object_id
 JOIN sys.schemas s ON t.schema_id = s.schema_id
-WHERE i.is_primary_key = 1 AND s.name = @p1 AND t.name = @p2
-ORDER BY ic.key_ordinal`, schema, table)
+WHERE i.is_primary_key = 1
+  AND ic.key_ordinal > 0
+  AND ic.is_included_column = 0
+  AND s.name = @p1
+  AND t.name = @p2
+ORDER BY ic.key_ordinal`, resolvedSchema, resolvedTable)
 	if err != nil {
 		return nil, DDLOutput{}, err
 	}
 	pkCols := make([]string, 0, len(pks))
 	for _, pk := range pks {
 		name, _ := pk["column"].(string)
-		qcol, err := sqlsafe.QuoteIdentifier(name)
+		qcol, err := sqlsafe.QuoteRawIdentifier(name)
 		if err != nil {
 			return nil, DDLOutput{}, err
 		}
@@ -620,9 +816,10 @@ ORDER BY ic.key_ordinal`, schema, table)
 	return nil, DDLOutput{DDL: ddl}, nil
 }
 
-func (r *Registry) tableSize(ctx context.Context, _ *mcp.CallToolRequest, _ any) (*mcp.CallToolResult, RowsOutput, error) {
+func (r *Registry) tableSize(ctx context.Context, _ *mcp.CallToolRequest, in ListTableInput) (*mcp.CallToolResult, RowsOutput, error) {
 	ctx, cancel := r.client.TimeoutContext(ctx)
 	defer cancel()
+	limit := bounded(in.Limit, 200, 1000)
 	rows, err := r.client.Query(ctx, `
 SELECT s.name AS [schema],
        t.name AS [table],
@@ -634,13 +831,16 @@ SELECT s.name AS [schema],
 FROM sys.tables t
 JOIN sys.schemas s ON t.schema_id = s.schema_id
 JOIN sys.dm_db_partition_stats ps ON t.object_id = ps.object_id
+WHERE (@p1 = '' OR s.name = @p1)
+  AND (@p2 = '' OR t.name LIKE @p2 ESCAPE '\')
 GROUP BY s.name, t.name
-ORDER BY SUM(ps.reserved_page_count) DESC, s.name, t.name`)
+ORDER BY SUM(ps.reserved_page_count) DESC, s.name, t.name
+OFFSET 0 ROWS FETCH NEXT @p3 ROWS ONLY`, in.Schema, patternOrEmpty(in.Filter), limit)
 	return nil, RowsOutput{Rows: rows}, err
 }
 
 type InsertInput struct {
-	Table string           `json:"table"`
+	Table string           `json:"table" jsonschema:"Table name as table or schema.table."`
 	Rows  []map[string]any `json:"rows"`
 }
 
@@ -648,6 +848,75 @@ type MutationOutput struct {
 	Executed     bool             `json:"executed"`
 	RowsAffected int64            `json:"rowsAffected"`
 	Preview      []map[string]any `json:"preview,omitempty"`
+}
+
+type insertStatement struct {
+	query string
+	args  []any
+}
+
+func buildInsertStatements(table string, rows []map[string]any) ([]insertStatement, error) {
+	const (
+		maxParamsPerBatch = 2000 // SQL Server RPC limit is 2100 parameters.
+		maxRowsPerBatch   = 1000 // SQL Server VALUES clause limit is 1000 rows.
+	)
+
+	var statements []insertStatement
+	var currentKey string
+	var currentQCols []string
+	var batchTuples []string
+	var batchArgs []any
+
+	flush := func() {
+		if len(batchTuples) == 0 {
+			return
+		}
+		statements = append(statements, insertStatement{
+			query: fmt.Sprintf("INSERT INTO %s (%s) VALUES %s", table, strings.Join(currentQCols, ", "), strings.Join(batchTuples, ", ")),
+			args:  batchArgs,
+		})
+		batchTuples = nil
+		batchArgs = nil
+	}
+
+	for _, row := range rows {
+		cols := sortedKeys(row)
+		if len(cols) == 0 {
+			return nil, fmt.Errorf("row cannot be empty")
+		}
+		if len(cols) > maxParamsPerBatch {
+			return nil, fmt.Errorf("row has %d columns, exceeding maximum parameter limit of %d", len(cols), maxParamsPerBatch)
+		}
+		qcols := make([]string, len(cols))
+		rowArgs := make([]any, len(cols))
+		for i, col := range cols {
+			qcol, err := sqlsafe.QuoteIdentifier(col)
+			if err != nil {
+				return nil, err
+			}
+			val, err := sqlsafe.NormalizeValue(row[col])
+			if err != nil {
+				return nil, fmt.Errorf("column %q: %w", col, err)
+			}
+			qcols[i] = qcol
+			rowArgs[i] = val
+		}
+		key := strings.Join(qcols, "\x00")
+		if key != currentKey || len(batchTuples) >= maxRowsPerBatch || len(batchArgs)+len(cols) > maxParamsPerBatch {
+			flush()
+			currentKey = key
+			currentQCols = qcols
+		}
+		placeholders := make([]string, len(cols))
+		base := len(batchArgs)
+		for i := range cols {
+			placeholders[i] = fmt.Sprintf("@p%d", base+i+1)
+		}
+		batchTuples = append(batchTuples, "("+strings.Join(placeholders, ", ")+")")
+		batchArgs = append(batchArgs, rowArgs...)
+	}
+	flush()
+	return statements, nil
 }
 
 func (r *Registry) insertData(ctx context.Context, _ *mcp.CallToolRequest, in InsertInput) (*mcp.CallToolResult, MutationOutput, error) {
@@ -661,32 +930,9 @@ func (r *Registry) insertData(ctx context.Context, _ *mcp.CallToolRequest, in In
 	if err != nil {
 		return nil, MutationOutput{}, err
 	}
-	type insertStatement struct {
-		query string
-		args  []any
-	}
-	statements := make([]insertStatement, 0, len(in.Rows))
-	for _, row := range in.Rows {
-		cols := sortedKeys(row)
-		if len(cols) == 0 {
-			return nil, MutationOutput{}, fmt.Errorf("row cannot be empty")
-		}
-		qcols := make([]string, len(cols))
-		params := make([]string, len(cols))
-		args := make([]any, len(cols))
-		for i, col := range cols {
-			qcol, err := sqlsafe.QuoteIdentifier(col)
-			if err != nil {
-				return nil, MutationOutput{}, err
-			}
-			qcols[i] = qcol
-			params[i] = fmt.Sprintf("@p%d", i+1)
-			args[i] = row[col]
-		}
-		statements = append(statements, insertStatement{
-			query: fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)", table, strings.Join(qcols, ", "), strings.Join(params, ", ")),
-			args:  args,
-		})
+	statements, err := buildInsertStatements(table, in.Rows)
+	if err != nil {
+		return nil, MutationOutput{}, err
 	}
 
 	ctx, cancel := r.client.TimeoutContext(ctx)
@@ -717,11 +963,28 @@ func (r *Registry) insertData(ctx context.Context, _ *mcp.CallToolRequest, in In
 }
 
 type WhereMutationInput struct {
-	Table   string         `json:"table"`
+	Table   string         `json:"table" jsonschema:"Table name as table or schema.table."`
 	Values  map[string]any `json:"values"`
 	Where   string         `json:"where"`
-	Params  map[string]any `json:"params,omitempty" jsonschema:"Values for named placeholders in where, keyed without @."`
+	Params  map[string]any `json:"params,omitempty" jsonschema:"Values for named placeholders in where, keyed without @. Pass integers beyond +/-2^53 as strings to keep full precision."`
 	Confirm bool           `json:"confirm,omitempty"`
+}
+
+func (r *Registry) previewWhereMutation(ctx context.Context, table, where string, args []any) (MutationOutput, error) {
+	countRows, err := r.client.Query(ctx, fmt.Sprintf("SELECT COUNT_BIG(*) AS [count] FROM %s WHERE (\n%s\n)", table, where), args...)
+	if err != nil {
+		return MutationOutput{}, err
+	}
+	var total int64
+	if len(countRows) > 0 {
+		total, _ = countRows[0]["count"].(int64)
+	}
+	previewLimit := max(r.client.Config.MaxRowsDefault, 1)
+	preview, err := r.client.Query(ctx, fmt.Sprintf("SELECT TOP (%d) * FROM %s WHERE (\n%s\n)", previewLimit, table, where), args...)
+	if err != nil {
+		return MutationOutput{}, err
+	}
+	return MutationOutput{Executed: false, RowsAffected: total, Preview: preview}, nil
 }
 
 func (r *Registry) updateData(ctx context.Context, _ *mcp.CallToolRequest, in WhereMutationInput) (*mcp.CallToolResult, MutationOutput, error) {
@@ -739,9 +1002,13 @@ func (r *Registry) updateData(ctx context.Context, _ *mcp.CallToolRequest, in Wh
 		if err != nil {
 			return nil, MutationOutput{}, err
 		}
-		name := fmt.Sprintf("__mcp_value_%d", i+1)
+		val, err := sqlsafe.NormalizeValue(in.Values[col])
+		if err != nil {
+			return nil, MutationOutput{}, fmt.Errorf("column %q: %w", col, err)
+		}
+		name := fmt.Sprintf("%svalue_%d", reservedParamPrefix, i+1)
 		set[i] = fmt.Sprintf("%s = @%s", qcol, name)
-		valueArgs = append(valueArgs, sql.Named(name, in.Values[col]))
+		valueArgs = append(valueArgs, sql.Named(name, val))
 	}
 	table, where, whereArgs, err := mutationTarget(in.Table, in.Where, in.Params)
 	if err != nil {
@@ -750,11 +1017,11 @@ func (r *Registry) updateData(ctx context.Context, _ *mcp.CallToolRequest, in Wh
 	ctx, cancel := r.client.TimeoutContext(ctx)
 	defer cancel()
 	if r.client.Config.RequireConfirmation && !in.Confirm {
-		preview, err := r.client.Query(ctx, fmt.Sprintf("SELECT TOP (%d) * FROM %s WHERE %s", r.client.Config.MaxRowsDefault, table, where), whereArgs...)
-		return nil, MutationOutput{Executed: false, Preview: preview}, err
+		out, err := r.previewWhereMutation(ctx, table, where, whereArgs)
+		return nil, out, err
 	}
-	allArgs := append(valueArgs, whereArgs...)
-	n, err := r.client.Exec(ctx, fmt.Sprintf("UPDATE %s SET %s WHERE %s", table, strings.Join(set, ", "), where), allArgs...)
+	valueArgs = append(valueArgs, whereArgs...)
+	n, err := r.client.Exec(ctx, fmt.Sprintf("UPDATE %s SET %s WHERE (\n%s\n)", table, strings.Join(set, ", "), where), valueArgs...)
 	if err != nil {
 		return nil, MutationOutput{}, err
 	}
@@ -762,9 +1029,9 @@ func (r *Registry) updateData(ctx context.Context, _ *mcp.CallToolRequest, in Wh
 }
 
 type DeleteInput struct {
-	Table   string         `json:"table"`
+	Table   string         `json:"table" jsonschema:"Table name as table or schema.table."`
 	Where   string         `json:"where"`
-	Params  map[string]any `json:"params,omitempty" jsonschema:"Values for named placeholders in where, keyed without @."`
+	Params  map[string]any `json:"params,omitempty" jsonschema:"Values for named placeholders in where, keyed without @. Pass integers beyond +/-2^53 as strings to keep full precision."`
 	Confirm bool           `json:"confirm,omitempty"`
 }
 
@@ -779,10 +1046,10 @@ func (r *Registry) deleteData(ctx context.Context, _ *mcp.CallToolRequest, in De
 	ctx, cancel := r.client.TimeoutContext(ctx)
 	defer cancel()
 	if r.client.Config.RequireConfirmation && !in.Confirm {
-		preview, err := r.client.Query(ctx, fmt.Sprintf("SELECT TOP (%d) * FROM %s WHERE %s", r.client.Config.MaxRowsDefault, table, where), args...)
-		return nil, MutationOutput{Executed: false, Preview: preview}, err
+		out, err := r.previewWhereMutation(ctx, table, where, args)
+		return nil, out, err
 	}
-	n, err := r.client.Exec(ctx, fmt.Sprintf("DELETE FROM %s WHERE %s", table, where), args...)
+	n, err := r.client.Exec(ctx, fmt.Sprintf("DELETE FROM %s WHERE (\n%s\n)", table, where), args...)
 	if err != nil {
 		return nil, MutationOutput{}, err
 	}
@@ -798,7 +1065,7 @@ type ColumnDef struct {
 }
 
 type CreateTableInput struct {
-	Table   string      `json:"table"`
+	Table   string      `json:"table" jsonschema:"Table name as table or schema.table."`
 	Columns []ColumnDef `json:"columns"`
 }
 
@@ -870,7 +1137,7 @@ func (r *Registry) createTable(ctx context.Context, _ *mcp.CallToolRequest, in C
 }
 
 type CreateIndexInput struct {
-	Table   string   `json:"table"`
+	Table   string   `json:"table" jsonschema:"Table name as table or schema.table."`
 	Name    string   `json:"name"`
 	Columns []string `json:"columns"`
 	Unique  bool     `json:"unique,omitempty"`
@@ -912,7 +1179,7 @@ func (r *Registry) createIndex(ctx context.Context, _ *mcp.CallToolRequest, in C
 }
 
 type DropTableInput struct {
-	Table   string `json:"table"`
+	Table   string `json:"table" jsonschema:"Table name as table or schema.table."`
 	Confirm bool   `json:"confirm,omitempty"`
 }
 
@@ -920,15 +1187,35 @@ func (r *Registry) dropTable(ctx context.Context, _ *mcp.CallToolRequest, in Dro
 	if !r.client.Config.AccessLevel.AllowsDDL() {
 		return nil, MutationOutput{}, fmt.Errorf("drop_table requires DDL-RW")
 	}
+	schema, tableName, err := splitTable(in.Table)
+	if err != nil {
+		return nil, MutationOutput{}, err
+	}
 	table, err := sqlsafe.QuoteMultipart(in.Table)
 	if err != nil {
 		return nil, MutationOutput{}, err
 	}
-	if r.client.Config.RequireConfirmation && !in.Confirm {
-		return nil, MutationOutput{Executed: false}, nil
-	}
 	ctx, cancel := r.client.TimeoutContext(ctx)
 	defer cancel()
+	if r.client.Config.RequireConfirmation && !in.Confirm {
+		preview, err := r.client.Query(ctx, `
+SELECT s.name AS [schema],
+       t.name AS [table],
+       COALESCE(SUM(CASE WHEN ps.index_id IN (0, 1) THEN ps.row_count ELSE 0 END), 0) AS [estimatedRows]
+FROM sys.tables t
+JOIN sys.schemas s ON t.schema_id = s.schema_id
+LEFT JOIN sys.dm_db_partition_stats ps ON t.object_id = ps.object_id
+WHERE s.name = COALESCE(NULLIF(@p1, ''), SCHEMA_NAME(), 'dbo') AND t.name = @p2
+GROUP BY s.name, t.name`, schema, tableName)
+		if err != nil {
+			return nil, MutationOutput{}, err
+		}
+		if len(preview) == 0 {
+			return nil, MutationOutput{}, fmt.Errorf("table %q was not found", in.Table)
+		}
+		estimatedRows, _ := preview[0]["estimatedRows"].(int64)
+		return nil, MutationOutput{Executed: false, RowsAffected: estimatedRows, Preview: preview}, nil
+	}
 	n, err := r.client.Exec(ctx, "DROP TABLE "+table)
 	if err != nil {
 		return nil, MutationOutput{}, err
@@ -953,13 +1240,20 @@ func patternOrEmpty(s string) string {
 	return sqlsafe.LikePattern(s)
 }
 
+// splitTable validates a 1- or 2-part table reference. When no schema is
+// supplied, schema is returned as "" so catalog queries can resolve SQL
+// Server's active SCHEMA_NAME() (falling back to 'dbo').
 func splitTable(name string) (string, string, error) {
-	parts := strings.Split(strings.TrimSpace(name), ".")
+	trimmed := strings.TrimSpace(name)
+	if trimmed == "" {
+		return "", "", fmt.Errorf("table is required")
+	}
+	parts := strings.Split(trimmed, ".")
 	if len(parts) == 1 {
 		if _, err := sqlsafe.QuoteIdentifier(parts[0]); err != nil {
 			return "", "", err
 		}
-		return "dbo", parts[0], nil
+		return "", strings.TrimSpace(parts[0]), nil
 	}
 	if len(parts) == 2 {
 		if _, err := sqlsafe.QuoteIdentifier(parts[0]); err != nil {
@@ -968,9 +1262,21 @@ func splitTable(name string) (string, string, error) {
 		if _, err := sqlsafe.QuoteIdentifier(parts[1]); err != nil {
 			return "", "", err
 		}
-		return parts[0], parts[1], nil
+		return strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1]), nil
 	}
 	return "", "", fmt.Errorf("table must be table or schema.table")
+}
+
+func quoteResolvedTable(schema, table string) (string, error) {
+	qschema, err := sqlsafe.QuoteRawIdentifier(schema)
+	if err != nil {
+		return "", err
+	}
+	qtable, err := sqlsafe.QuoteRawIdentifier(table)
+	if err != nil {
+		return "", err
+	}
+	return qschema + "." + qtable, nil
 }
 
 func sortedKeys(m map[string]any) []string {
@@ -1081,6 +1387,10 @@ func identityTypeAllowed(typ string) bool {
 		base == "decimal" || base == "numeric"
 }
 
+// reservedParamPrefix names update_data's internal SET parameters. It must start
+// with a letter because database/sql rejects named arguments that do not.
+const reservedParamPrefix = "mcp__"
+
 func mutationTarget(tableName, where string, params map[string]any) (string, string, []any, error) {
 	table, err := sqlsafe.QuoteMultipart(tableName)
 	if err != nil {
@@ -1090,12 +1400,12 @@ func mutationTarget(tableName, where string, params map[string]any) (string, str
 	if where == "" {
 		return "", "", nil, fmt.Errorf("where is required")
 	}
-	if err := sqlsafe.ValidateReadOnlyQuery("SELECT * FROM x WHERE " + where); err != nil {
+	if err := sqlsafe.ValidateWhereClause(where); err != nil {
 		return "", "", nil, fmt.Errorf("where clause contains disallowed SQL: %w", err)
 	}
 	for name := range params {
-		if strings.HasPrefix(strings.ToLower(name), "__mcp_") {
-			return "", "", nil, fmt.Errorf("parameter name %q uses the reserved __mcp_ prefix", name)
+		if strings.HasPrefix(strings.ToLower(name), reservedParamPrefix) {
+			return "", "", nil, fmt.Errorf("parameter name %q uses the reserved %s prefix", name, reservedParamPrefix)
 		}
 	}
 	args, err := sqlsafe.BindNamedParameters(where, params)
