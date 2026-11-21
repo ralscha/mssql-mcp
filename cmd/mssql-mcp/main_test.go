@@ -58,7 +58,9 @@ func TestHTTPBearerTokenAuth(t *testing.T) {
 	}()
 	defer func() {
 		cancel()
-		<-done
+		if err := <-done; err != nil {
+			t.Errorf("runServer() = %v", err)
+		}
 	}()
 
 	endpoint := "http://" + addr + "/mcp"
